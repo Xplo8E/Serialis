@@ -20,18 +20,22 @@ Built with **Swift and AppKit**, with no third-party dependencies.
 - **Light and dark appearance**, switched beside Settings.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="images/serialis-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="images/serialis-light.png">
-  <img src="images/serialis-light.png" alt="Serialis showing saved sessions and searchable serial logs" width="1280">
+  <source media="(prefers-color-scheme: light)" srcset="images/serialis-dark.png">
+  <source media="(prefers-color-scheme: dark)" srcset="images/serialis-light.png">
+  <img src="images/serialis-light.png" width="1280">
 </picture>
 
 *App previews use synthetic logs. [Light preview](images/serialis-light.png) · [Dark preview](images/serialis-dark.png)*
 
 ## Supported hardware
 
-The current device profile supports **B4 Pico Ultra CDC** at **115200 baud, 8N1, no flow control**. Other serial adapters and configurable baud rates are not supported yet.
+The current device profile supports **B4 Pico Ultra CDC** at **115200 baud, 8N1, no flow control**. Other serial adapters and configurable baud rates are not tested yet.
 
 Discovery requires VID `2e8a`, PID `00b7`, manufacturer `B4`, product `B4 PICO Ultra CDC`, and a nonempty USB serial number. Serialis is an independent application, not a vendor firmware utility. It receives serial output; it does not send commands or configure the connected device's firmware.
+
+<picture>
+<img src="images/IMG_0025.JPG">
+</picture>
 
 ## Build and run
 
