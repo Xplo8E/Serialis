@@ -6,6 +6,7 @@ BIN_DIR="$(xcrun swift build -c release --show-bin-path)"
 APP_DIR="$PWD/dist/Serialis.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_DIR/Serialis" "$APP_DIR/Contents/MacOS/Serialis"
+cp LICENSE "$APP_DIR/Contents/Resources/LICENSE"
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

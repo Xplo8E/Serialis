@@ -5,3 +5,4 @@ dist/
 xcuserdata/
 .swiftpm/
 benchmark-results/
+/docs/

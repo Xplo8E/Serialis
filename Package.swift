@@ -7,7 +7,8 @@ let package = Package(
     products: [.executable(name: "Serialis", targets: ["Serialis"])],
     targets: [
         .target(name: "SerialisCore"),
-        .executableTarget(name: "Serialis", dependencies: ["SerialisCore"]),
+        // Xcode compiles the app icon into the application bundle.
+        .executableTarget(name: "Serialis", dependencies: ["SerialisCore"], exclude: ["Assets.xcassets"]),
         .testTarget(name: "SerialisCoreTests", dependencies: ["SerialisCore"])
     ]
 )

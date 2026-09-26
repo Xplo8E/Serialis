@@ -80,7 +80,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         let menu = NSMenu()
         let app = NSMenuItem()
         app.submenu = NSMenu(title: "Serialis")
-        app.submenu?.addItem(withTitle: "About Serialis", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let about = app.submenu!.addItem(withTitle: "About Serialis", action: #selector(showAbout), keyEquivalent: "")
+        about.target = self
         app.submenu?.addItem(.separator())
         app.submenu?.addItem(withTitle: "Quit Serialis", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(app)
@@ -103,6 +104,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         previous.target = self
         menu.addItem(find)
         NSApp.mainMenu = menu
+    }
+
+    @objc private func showAbout() {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let credits = NSAttributedString(
+            string: "Created by\nVinay Kumar Rasala (Xplo8E)\n\nLicensed under GNU GPLv3 only\nProvided without warranty.",
+            attributes: [.font: NSFont.systemFont(ofSize: 13),
+                         .foregroundColor: NSColor.labelColor,
+                         .paragraphStyle: paragraph]
+        )
+        // Keep the native About panel's bundle icon and version information.
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
     }
 
     private func buildWindow() {

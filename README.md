@@ -1,56 +1,68 @@
-# Serialis
+<p align="center">
+  <img src="images/serialis-icon.png" width="144" height="144" alt="Serialis app icon">
+</p>
 
-A small native macOS app for watching and saving serial logs. Built with Swift and AppKit, with no third-party dependencies.
+<h1 align="center">Serialis</h1>
 
-Serialis identifies a supported USB serial interface, remembers your selection, and saves the incoming bytes while you browse the log. A changing `/dev/cu.usbmodem…` path does not change the saved device identity.
+<p align="center">A native macOS serial console for live logs and saved research sessions.</p>
+
+Serialis detects a supported USB interface, captures its serial output, and saves the raw bytes while you read, search, or browse earlier sessions. It remembers the device identity, so a changing `/dev/cu.usbmodem…` path does not require manual configuration.
+
+Built with **Swift and AppKit**, with no third-party dependencies.
+
+## Features
+
+- **Automatic capture** at 115200 baud, with remembered interface selection and reconnect handling.
+- **Live logs that wrap** with the window, including character-level selection and native copy/paste.
+- **Search with match counts**, previous/next navigation, and keyboard shortcuts.
+- **Pause the display while recording continues**, then resume with the intervening logs available.
+- **Saved sessions** with raw output, byte-preserving selection export, and connection history.
+- **Light and dark appearance**, switched beside Settings.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/serialis-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="images/serialis-light.png">
+  <img src="images/serialis-light.png" alt="Serialis showing saved sessions and searchable serial logs" width="1280">
+</picture>
+
+*App previews use synthetic logs. [Light preview](images/serialis-light.png) · [Dark preview](images/serialis-dark.png)*
+
+## Supported hardware
+
+The current device profile supports **B4 Pico Ultra CDC** at **115200 baud, 8N1, no flow control**. Other serial adapters and configurable baud rates are not supported yet.
+
+Discovery requires VID `2e8a`, PID `00b7`, manufacturer `B4`, product `B4 PICO Ultra CDC`, and a nonempty USB serial number. Serialis is an independent application, not a vendor firmware utility. It receives serial output; it does not send commands or configure the connected device's firmware.
 
 ## Build and run
 
-Requires macOS 13 or later and Xcode with its command-line tools selected.
+Requires **macOS 13 or later**. The Xcode project requires **Xcode 16 or later**. Runtime validation so far has been on Apple Silicon with macOS 26.7; earlier supported macOS versions have not been tested.
+
+### Xcode
+
+1. Open `Serialis.xcodeproj`.
+2. Select the **Serialis** scheme and **My Mac** destination.
+3. In **Serialis target → Signing & Capabilities**, select your development team.
+4. Run with **⌘R**. Run the core tests with **⌘U**.
+
+Automatic signing is enabled, with the team unset in the repository. The bundle identifier is `com.xplo8e.serialis` in Debug and Release. Xcode builds include the app icon.
+
+### Command line
+
+With Xcode's command-line tools selected:
 
 ```sh
 ./scripts/build-app.sh
 open dist/Serialis.app
 ```
 
-### Xcode
+The script builds through Swift Package Manager and creates a local ad-hoc signed app. It does not compile the Xcode icon catalog. Use Xcode for the branded application and your development signing identity. These local builds are not notarized distribution releases.
 
-Open `Serialis.xcodeproj`, select the **Serialis** scheme and **My Mac** destination, then run with `⌘R`. The native project includes the app, its `SerialisCore` static library, and the storage tests (`⌘U`). Source folders are synchronized, so new Swift files appear automatically. Xcode 16 or later is required for this project format.
-
-In **Serialis target → Signing & Capabilities**, select your team. Automatic signing is enabled; the repository default leaves the team unset. Local team selection is made in Xcode. The app's bundle identifier is **`com.xplo8e.serialis`** in Debug and Release. Account credentials and private signing keys do not belong in the repository.
-
-The Swift package remains available for command-line builds and tests. The build script uses `xcrun swift` to select Xcode's toolchain; a separately installed Swift may not match the installed SDK. `scripts/build-app.sh` still creates a local ad-hoc signed app; use Xcode for your selected development signing identity.
-
-The generated app is signed locally with an ad-hoc signature. It is not a notarized distribution release.
-
-## Capture
+## Start capturing
 
 - On first use, one supported interface is selected automatically. If several are connected, choose one in **Settings**.
 - The selection is remembered using USB identity and serial number. A missing remembered device is not replaced with another board.
 - Reconnecting the selected board resumes the current session. Switching interfaces records a new segment with its byte offsets.
-- The port uses **115200 baud, 8N1, no flow control**. There is no terminal input or transmit feature.
 - If another program such as `tio` owns the port, close that connection and choose **Retry**. Serialis does not terminate the other program.
-
-The first supported profile matches VID `2e8a`, PID `00b7`, manufacturer `B4`, product `B4 PICO Ultra CDC`, and a nonempty serial number. Other serial adapters are not accepted yet. Serialis is an independent app, not a vendor firmware utility.
-
-## Appearance
-
-Click the sun/moon button immediately left of **Settings** to switch between light and dark. Serialis remembers your choice across launches. Until you choose a theme, it follows your Mac’s appearance.
-
-## Reading logs
-
-**Pause Display** freezes the displayed snapshot while capture continues. **Resume Display** includes everything captured during the pause and returns to the latest row.
-
-Scrolling up or selecting text stops automatic scrolling. New data still becomes part of the session. **Jump to Latest** resumes following. Opening a saved session also leaves current capture running; **Return to Live** restores the live view.
-
-- Search is literal, case-sensitive UTF-8 text. Return or **Next** finds the next match; **Previous** searches backward. Both wrap at the end. The counter shows your position, such as **3 of 24 matches**. New captured matches update the total without moving the current result. Paste into the search field with `⌘V`.
-- `⌘F` opens the search bar and focuses search, `⌘G` finds next, and `⇧⌘G` finds previous.
-- Logs wrap to the available width and reflow when the window, sidebar, or inspector changes size.
-- Drag to select text within or across lines, then `⌘C` or right-click **Copy** to copy. A plain click replaces the previous selection; Shift-click extends it. Double-click selects a word, triple-click selects a line.
-- Double-click an empty area of the top bar to maximize the window; double-click again to restore its previous size.
-- `⌘E` exports selected text as their original bytes. Selections over 16 MiB are offered as an export to avoid a large clipboard allocation.
-- Rows longer than 16 KiB are split for display. Invalid UTF-8 is replaced visually; raw bytes remain unchanged. Serialis is a log viewer and does not emulate ANSI terminal escape sequences.
-- **Inspector** shows session details, the latest source interface, file links, and recent connection events. Full segment byte ranges remain in `metadata.json`.
 
 ## Files and memory
 
@@ -64,11 +76,13 @@ Sessions live under `~/Library/Application Support/Serialis/Sessions/`. Each app
 
 The viewer reads visible rows on demand. Search and export read small chunks. The capture queue coalesces UI updates so a blocked window does not accumulate snapshots.
 
+The current wrapped viewer exceeded the 100 MB peak-footprint target in the large-session Release checks; it is not yet a guaranteed memory ceiling.
+
 Data is written on receipt and synchronized approximately once per second or every MiB. Normal exit finishes the session. An abrupt power loss can still lose recently buffered bytes. Interrupted index writes can be repaired from the raw file when opening a session. Original raw data is never rewritten by recovery.
 
 There is no automatic deletion or retention limit. Use **Open Sessions Folder** to archive old captures. Disk-write errors stop capture and are shown in the status bar.
 
-## Validation
+## Development
 
 ```sh
 xcrun swift test
@@ -80,4 +94,8 @@ dist/Serialis.app/Contents/MacOS/Serialis --ui-smoke
 
 The benchmark writes a 1 GiB fixture under `benchmark-results/`, performs random reads, and searches the full file. UI smoke tests use temporary fixtures and never open hardware. Use `--ui-smoke --no-snapshot --session PATH` to exercise an existing saved fixture without allocating an image.
 
+## License
 
+Copyright © 2026 Vinay Kumar Rasala (Xplo8E).
+
+Serialis is licensed under the [GNU General Public License, version 3 only](LICENSE) (`GPL-3.0-only`).
