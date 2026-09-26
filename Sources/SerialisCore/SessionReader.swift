@@ -1,0 +1,500 @@
+import Darwin
+import Foundation
+
+public final class SessionReader {
+    private let directory: URL
+    private let rawURL: URL
+    private let indexURL: URL
+    private let rawFD: Int32
+    private let indexFD: Int32
+
+    public init(directory: URL) throws {
+        self.directory = directory
+        rawURL = SessionFiles.rawURL(in: directory)
+        indexURL = SessionFiles.indexURL(in: directory)
+
+        rawFD = open(rawURL.path, O_RDONLY)
+        guard rawFD >= 0 else {
+            throw SessionStoreError.invalidSessionDirectory(directory)
+        }
+
+        indexFD = open(indexURL.path, O_RDONLY)
+        guard indexFD >= 0 else {
+            close(rawFD)
+            throw SessionStoreError.invalidSessionDirectory(directory)
+        }
+    }
+
+    deinit {
+        close(rawFD)
+        close(indexFD)
+    }
+
+    public static func loadSnapshot(directory: URL, validateIndex: Bool = true) throws -> SessionSnapshot {
+        let metadataURL = SessionFiles.metadataURL(in: directory)
+        let indexURL = SessionFiles.indexURL(in: directory)
+        let rawURL = SessionFiles.rawURL(in: directory)
+
+        guard FileManager.default.fileExists(atPath: metadataURL.path),
+              FileManager.default.fileExists(atPath: rawURL.path),
+              FileManager.default.fileExists(atPath: indexURL.path)
+        else {
+            throw SessionStoreError.invalidSessionDirectory(directory)
+        }
+
+        let metadataData = try Data(contentsOf: metadataURL)
+        var metadata = try JSONDecoder().decode(SessionMetadata.self, from: metadataData)
+        let byteCount = rawURL.fileSize
+        metadata.totalBytes = byteCount
+
+        let indexSize = indexURL.fileSize
+        guard indexSize % UInt64(MemoryLayout<UInt64>.size) == 0 else {
+            throw SessionStoreError.corruptIndex(indexURL)
+        }
+
+        let rowCount: UInt64
+        if validateIndex {
+            try recoverIndexIfNeeded(rawURL: rawURL, indexURL: indexURL, byteCount: byteCount)
+            rowCount = try validatedRowCount(rawURL: rawURL, indexURL: indexURL, byteCount: byteCount)
+        } else {
+            rowCount = indexSize / UInt64(MemoryLayout<UInt64>.size)
+        }
+
+        return SessionSnapshot(
+            directory: directory,
+            metadata: metadata,
+            byteCount: byteCount,
+            rowCount: rowCount
+        )
+    }
+
+    public func readRow(_ row: UInt64, snapshot: SessionSnapshot) throws -> LogRow {
+        guard row < snapshot.rowCount else {
+            throw SessionStoreError.rowOutOfBounds(row)
+        }
+
+        let start = try rowOffset(row)
+        let end: UInt64
+        if row + 1 < snapshot.rowCount {
+            end = try rowOffset(row + 1)
+        } else {
+            end = snapshot.byteCount
+        }
+
+        guard end <= snapshot.byteCount,
+              start <= end,
+              end - start <= UInt64(SessionFiles.maxDisplayRowBytes)
+        else {
+            throw SessionStoreError.corruptIndex(indexURL)
+        }
+
+        return LogRow(offset: start, data: try readRawBytes(in: start..<end))
+    }
+
+    public func readBytes(in range: Range<UInt64>) throws -> Data {
+        let byteCount = try rawByteCount()
+        guard range.lowerBound <= range.upperBound,
+              range.upperBound <= byteCount
+        else {
+            throw SessionStoreError.byteRangeOutOfBounds(range)
+        }
+        return try readRawBytes(in: range)
+    }
+
+    public func row(containing offset: UInt64, snapshot: SessionSnapshot) throws -> UInt64 {
+        guard snapshot.rowCount > 0 else { return 0 }
+        if offset >= snapshot.byteCount {
+            return snapshot.rowCount - 1
+        }
+
+        var low: UInt64 = 0
+        var high = snapshot.rowCount
+        while low < high {
+            let middle = (low + high) / 2
+            let rowStart = try rowOffset(middle)
+            if rowStart <= offset {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        return low == 0 ? 0 : low - 1
+    }
+
+    public func find(
+        _ query: Data,
+        from offset: UInt64,
+        backwards: Bool,
+        snapshot: SessionSnapshot,
+        isCancelled: () -> Bool
+    ) throws -> Range<UInt64>? {
+        guard !query.isEmpty else {
+            throw SessionStoreError.invalidQuery
+        }
+        guard snapshot.byteCount >= UInt64(query.count) else {
+            return nil
+        }
+
+        if backwards {
+            return try findBackwards(query, from: offset, snapshot: snapshot, isCancelled: isCancelled)
+        }
+        return try findForwards(query, from: offset, snapshot: snapshot, isCancelled: isCancelled)
+    }
+
+    private func findForwards(
+        _ query: Data,
+        from offset: UInt64,
+        snapshot: SessionSnapshot,
+        isCancelled: () -> Bool
+    ) throws -> Range<UInt64>? {
+        let queryCount = UInt64(query.count)
+        guard offset + queryCount <= snapshot.byteCount else { return nil }
+
+        let chunkSize = max(UInt64(64 * 1024), queryCount)
+        let overlap = queryCount - 1
+        var cursor = offset
+
+        while cursor < snapshot.byteCount {
+            if isCancelled() { return nil }
+
+            let readStart = cursor > overlap ? cursor - overlap : cursor
+            let readEnd = min(snapshot.byteCount, cursor + chunkSize)
+            let data = try readRawBytes(in: readStart..<readEnd)
+
+            var searchStart = data.startIndex
+            while let range = data.range(of: query, in: searchStart..<data.endIndex) {
+                let foundStart = readStart + UInt64(range.lowerBound)
+                if foundStart >= offset {
+                    return foundStart..<(foundStart + queryCount)
+                }
+                searchStart = data.index(after: range.lowerBound)
+            }
+
+            if readEnd == snapshot.byteCount { break }
+            cursor = readEnd
+        }
+        return nil
+    }
+
+    private func findBackwards(
+        _ query: Data,
+        from offset: UInt64,
+        snapshot: SessionSnapshot,
+        isCancelled: () -> Bool
+    ) throws -> Range<UInt64>? {
+        let queryCount = UInt64(query.count)
+        let maxStart = min(offset, snapshot.byteCount - queryCount)
+        let chunkSize = max(UInt64(64 * 1024), queryCount)
+        var maxCandidate = maxStart
+
+        while true {
+            if isCancelled() { return nil }
+
+            let readStart = maxCandidate + 1 > chunkSize ? maxCandidate + 1 - chunkSize : 0
+            let readEnd = min(snapshot.byteCount, maxCandidate + queryCount)
+            let data = try readRawBytes(in: readStart..<readEnd)
+
+            if let range = data.range(of: query, options: [.backwards]) {
+                let foundStart = readStart + UInt64(range.lowerBound)
+                if foundStart <= maxCandidate {
+                    return foundStart..<(foundStart + queryCount)
+                }
+            }
+
+            if readStart == 0 { break }
+            maxCandidate = readStart - 1
+        }
+        return nil
+    }
+
+    private func rowOffset(_ row: UInt64) throws -> UInt64 {
+        let size = UInt64(MemoryLayout<UInt64>.size)
+        let data = try read(fd: indexFD, offset: row * size, count: Int(size), source: indexURL.path)
+        return data.withUnsafeBytes { pointer in
+            pointer.loadUnaligned(as: UInt64.self).littleEndian
+        }
+    }
+
+    private func readRawBytes(in range: Range<UInt64>) throws -> Data {
+        try read(fd: rawFD, offset: range.lowerBound, count: Int(range.count), source: rawURL.path)
+    }
+
+    private func read(fd: Int32, offset: UInt64, count: Int, source: String) throws -> Data {
+        guard count > 0 else { return Data() }
+
+        var data = Data(count: count)
+        var remaining = count
+        var written = 0
+        var readOffset = off_t(offset)
+
+        try data.withUnsafeMutableBytes { pointer in
+            guard let base = pointer.baseAddress else { return }
+
+            while remaining > 0 {
+                let result = pread(fd, base.advanced(by: written), remaining, readOffset)
+                if result < 0 {
+                    throw SessionStoreError.readFailed("pread failed for \(source): errno \(errno)")
+                }
+                if result == 0 {
+                    throw SessionStoreError.readFailed("Unexpected EOF while reading \(source)")
+                }
+
+                remaining -= result
+                written += result
+                readOffset += off_t(result)
+            }
+        }
+        return data
+    }
+
+    private func rawByteCount() throws -> UInt64 {
+        var info = stat()
+        guard fstat(rawFD, &info) == 0 else {
+            throw SessionStoreError.readFailed("fstat failed for \(rawURL.path): errno \(errno)")
+        }
+        return UInt64(info.st_size)
+    }
+
+    private static func recoverIndexIfNeeded(rawURL: URL, indexURL: URL, byteCount: UInt64) throws {
+        let entrySize = UInt64(MemoryLayout<UInt64>.size)
+        let indexSize = indexURL.fileSize
+        guard indexSize % entrySize == 0 else {
+            throw SessionStoreError.corruptIndex(indexURL)
+        }
+
+        let rawFD = open(rawURL.path, O_RDONLY)
+        guard rawFD >= 0 else {
+            throw SessionStoreError.invalidSessionDirectory(rawURL.deletingLastPathComponent())
+        }
+        defer { close(rawFD) }
+
+        let indexReadFD = open(indexURL.path, O_RDONLY)
+        guard indexReadFD >= 0 else {
+            throw SessionStoreError.invalidSessionDirectory(indexURL.deletingLastPathComponent())
+        }
+        defer { close(indexReadFD) }
+
+        let rowCount = indexSize / entrySize
+        if byteCount == 0 {
+            guard rowCount == 0 else { throw SessionStoreError.corruptIndex(indexURL) }
+            return
+        }
+
+        var scanStart: UInt64 = 0
+        let shouldAppendInitialRow = rowCount == 0
+        if rowCount > 0 {
+            scanStart = try readIndexOffset(fd: indexReadFD, row: rowCount - 1, source: indexURL.path)
+            guard scanStart < byteCount else {
+                throw SessionStoreError.corruptIndex(indexURL)
+            }
+            let tailSize = byteCount - scanStart
+            if tailSize <= UInt64(SessionFiles.maxDisplayRowBytes) {
+                let tail = try readFromFD(rawFD, offset: scanStart, count: Int(tailSize), source: rawURL.path)
+                // A healthy final row needs no repair. Avoid copying a large index just to discover that.
+                if !tail.dropLast().contains(0x0A) { return }
+            }
+        }
+
+        let temporaryIndexURL = indexURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(indexURL.lastPathComponent).recovery.\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: temporaryIndexURL.path, contents: nil)
+        let temporaryIndexFD = open(temporaryIndexURL.path, O_WRONLY | O_APPEND)
+        guard temporaryIndexFD >= 0 else {
+            throw SessionStoreError.invalidSessionDirectory(indexURL.deletingLastPathComponent())
+        }
+        defer {
+            close(temporaryIndexFD)
+            try? FileManager.default.removeItem(at: temporaryIndexURL)
+        }
+
+        if rowCount > 0 {
+            try copyFileBytes(from: indexReadFD, to: temporaryIndexFD, byteCount: indexSize, source: indexURL.path)
+        }
+
+        var pendingRecoveredOffsets = Data()
+        func appendRecoveredOffset(_ offset: UInt64) throws {
+            appendOffset(offset, to: &pendingRecoveredOffsets)
+            if pendingRecoveredOffsets.count >= 64 * 1024 {
+                try writeAll(fd: temporaryIndexFD, data: pendingRecoveredOffsets, source: temporaryIndexURL.path)
+                pendingRecoveredOffsets.removeAll(keepingCapacity: true)
+            }
+        }
+
+        if shouldAppendInitialRow {
+            try appendRecoveredOffset(0)
+        }
+
+        // Re-scan the final indexed row and all unindexed raw bytes. This is bounded
+        // by a 64 KiB read buffer, and repairs the crash window after raw append.
+        var cursor = scanStart
+        var hasOpenRow = rowCount > 0 || shouldAppendInitialRow
+        var currentRowLength = 0
+        let readBufferSize = 64 * 1024
+
+        while cursor < byteCount {
+            let count = Int(min(UInt64(readBufferSize), byteCount - cursor))
+            let chunk = try readFromFD(rawFD, offset: cursor, count: count, source: rawURL.path)
+
+            for byte in chunk {
+                if !hasOpenRow {
+                    try appendRecoveredOffset(cursor)
+                    hasOpenRow = true
+                } else if currentRowLength == SessionFiles.maxDisplayRowBytes {
+                    try appendRecoveredOffset(cursor)
+                    currentRowLength = 0
+                }
+
+                currentRowLength += 1
+                cursor += 1
+
+                if byte == 0x0A {
+                    hasOpenRow = false
+                    currentRowLength = 0
+                }
+            }
+        }
+
+        guard !pendingRecoveredOffsets.isEmpty || temporaryIndexURL.fileSize > indexSize else {
+            return
+        }
+
+        if !pendingRecoveredOffsets.isEmpty {
+            try writeAll(fd: temporaryIndexFD, data: pendingRecoveredOffsets, source: temporaryIndexURL.path)
+            pendingRecoveredOffsets.removeAll(keepingCapacity: true)
+        }
+
+        guard fsync(temporaryIndexFD) == 0 else {
+            throw SessionStoreError.readFailed("fsync failed for \(temporaryIndexURL.path): errno \(errno)")
+        }
+        _ = try validatedRowCount(rawURL: rawURL, indexURL: temporaryIndexURL, byteCount: byteCount)
+        _ = try FileManager.default.replaceItemAt(indexURL, withItemAt: temporaryIndexURL)
+    }
+
+    private static func validatedRowCount(rawURL: URL, indexURL: URL, byteCount: UInt64) throws -> UInt64 {
+        let entrySize = UInt64(MemoryLayout<UInt64>.size)
+        let indexSize = indexURL.fileSize
+        guard indexSize % entrySize == 0 else {
+            throw SessionStoreError.corruptIndex(indexURL)
+        }
+
+        let rowCount = indexSize / entrySize
+        guard rowCount > 0 else {
+            guard byteCount == 0 else { throw SessionStoreError.corruptIndex(indexURL) }
+            return 0
+        }
+
+        let indexFD = open(indexURL.path, O_RDONLY)
+        guard indexFD >= 0 else {
+            throw SessionStoreError.invalidSessionDirectory(indexURL.deletingLastPathComponent())
+        }
+        defer { close(indexFD) }
+
+        var firstBuffer = Data()
+        firstBuffer.reserveCapacity(64 * 1024)
+        let firstReadCount = Int(min(indexSize, UInt64(64 * 1024)))
+        firstBuffer = try readFromFD(indexFD, offset: 0, count: firstReadCount, source: indexURL.path)
+        var firstCursor = 0
+        var previous = firstBuffer.withUnsafeBytes { pointer in
+            pointer.loadUnaligned(fromByteOffset: firstCursor, as: UInt64.self).littleEndian
+        }
+        firstCursor += MemoryLayout<UInt64>.size
+        guard previous == 0, previous < byteCount else {
+            throw SessionStoreError.corruptIndex(indexURL)
+        }
+
+        var fileOffset = UInt64(firstBuffer.count)
+        var remainingRows = rowCount - 1
+        var buffer = firstBuffer
+        var cursor = firstCursor
+
+        while remainingRows > 0 {
+            if cursor == buffer.count {
+                let readCount = Int(min(UInt64(64 * 1024), indexSize - fileOffset))
+                buffer = try readFromFD(indexFD, offset: fileOffset, count: readCount, source: indexURL.path)
+                fileOffset += UInt64(readCount)
+                cursor = 0
+            }
+
+            let current = buffer.withUnsafeBytes { pointer in
+                pointer.loadUnaligned(fromByteOffset: cursor, as: UInt64.self).littleEndian
+            }
+            cursor += MemoryLayout<UInt64>.size
+            remainingRows -= 1
+
+                guard current > previous,
+                      current <= byteCount,
+                      current - previous <= UInt64(SessionFiles.maxDisplayRowBytes)
+                else {
+                    throw SessionStoreError.corruptIndex(indexURL)
+                }
+                previous = current
+        }
+
+        guard byteCount - previous <= UInt64(SessionFiles.maxDisplayRowBytes) else {
+            throw SessionStoreError.corruptIndex(indexURL)
+        }
+        return rowCount
+    }
+
+    private static func readIndexOffset(fd: Int32, row: UInt64, source: String) throws -> UInt64 {
+        let size = MemoryLayout<UInt64>.size
+        let data = try readFromFD(fd, offset: row * UInt64(size), count: size, source: source)
+        return data.withUnsafeBytes { pointer in
+            pointer.loadUnaligned(as: UInt64.self).littleEndian
+        }
+    }
+
+    private static func appendOffset(_ offset: UInt64, to data: inout Data) {
+        var littleEndian = offset.littleEndian
+        data.append(Data(bytes: &littleEndian, count: MemoryLayout<UInt64>.size))
+    }
+
+    private static func copyFileBytes(from inputFD: Int32, to outputFD: Int32, byteCount: UInt64, source: String) throws {
+        var copied: UInt64 = 0
+        while copied < byteCount {
+            let readCount = Int(min(UInt64(64 * 1024), byteCount - copied))
+            let data = try readFromFD(inputFD, offset: copied, count: readCount, source: source)
+            try writeAll(fd: outputFD, data: data, source: source)
+            copied += UInt64(readCount)
+        }
+    }
+
+    private static func writeAll(fd: Int32, data: Data, source: String) throws {
+        try data.withUnsafeBytes { pointer in
+            guard let base = pointer.baseAddress else { return }
+            var written = 0
+            while written < data.count {
+                let result = Darwin.write(fd, base.advanced(by: written), data.count - written)
+                if result < 0 {
+                    throw SessionStoreError.readFailed("write failed for \(source): errno \(errno)")
+                }
+                written += result
+            }
+        }
+    }
+
+    private static func readFromFD(_ fd: Int32, offset: UInt64, count: Int, source: String) throws -> Data {
+        guard count > 0 else { return Data() }
+        var data = Data(count: count)
+        var remaining = count
+        var written = 0
+        var readOffset = off_t(offset)
+
+        try data.withUnsafeMutableBytes { pointer in
+            guard let base = pointer.baseAddress else { return }
+            while remaining > 0 {
+                let result = pread(fd, base.advanced(by: written), remaining, readOffset)
+                if result < 0 {
+                    throw SessionStoreError.readFailed("pread failed for \(source): errno \(errno)")
+                }
+                if result == 0 {
+                    throw SessionStoreError.readFailed("Unexpected EOF while reading \(source)")
+                }
+                remaining -= result
+                written += result
+                readOffset += off_t(result)
+            }
+        }
+        return data
+    }
+}
