@@ -141,6 +141,74 @@ public final class SessionReader {
         return try findForwards(query, from: offset, snapshot: snapshot, isCancelled: isCancelled)
     }
 
+    /// Reuse the count on navigation, and count only newly completed matches when
+    /// capture grows. One match range and two counters keep memory independent of hits.
+    public func search(
+        _ query: Data,
+        previous: SessionSearchResult?,
+        backwards: Bool,
+        advance: Bool = true,
+        snapshot: SessionSnapshot,
+        isCancelled: () -> Bool
+    ) throws -> SessionSearchResult {
+        guard !query.isEmpty else { throw SessionStoreError.invalidQuery }
+        let prior = previous.flatMap {
+            $0.query == query && $0.directory == snapshot.directory && $0.byteCount <= snapshot.byteCount ? $0 : nil
+        }
+        let overlap = UInt64(query.count - 1)
+        let oldEnd = prior?.byteCount ?? 0
+        let countStart = oldEnd > overlap ? oldEnd - overlap : 0
+        var total = prior?.total ?? 0
+        if prior == nil || oldEnd < snapshot.byteCount {
+            total += try countMatches(query, from: countStart, snapshot: snapshot, isCancelled: isCancelled)
+        }
+        if isCancelled() { throw CancellationError() }
+
+        var match = prior?.match
+        var number = prior?.number ?? 0
+        if total > 0 && (advance || match == nil) {
+            let start: UInt64
+            if backwards { start = match.map { $0.lowerBound > 0 ? $0.lowerBound - 1 : snapshot.byteCount } ?? snapshot.byteCount }
+            else { start = match.map { $0.lowerBound + 1 } ?? 0 }
+            match = try find(query, from: start, backwards: backwards, snapshot: snapshot, isCancelled: isCancelled)
+            if match == nil && !isCancelled() {
+                match = try find(query, from: backwards ? snapshot.byteCount : 0, backwards: backwards,
+                                 snapshot: snapshot, isCancelled: isCancelled)
+            }
+            if backwards { number = number > 1 ? number - 1 : total }
+            else { number = number < total ? number + 1 : 1 }
+        }
+        if isCancelled() { throw CancellationError() }
+        return SessionSearchResult(query: query, directory: snapshot.directory, byteCount: snapshot.byteCount,
+                                   total: total, number: number, match: match)
+    }
+
+    private func countMatches(_ query: Data, from offset: UInt64, snapshot: SessionSnapshot,
+                              isCancelled: () -> Bool) throws -> UInt64 {
+        let length = UInt64(query.count)
+        guard snapshot.byteCount >= length else { return 0 }
+        let candidateEnd = snapshot.byteCount - length + 1
+        let chunkSize = UInt64(64 * 1024)
+        var cursor = offset
+        var count: UInt64 = 0
+        while cursor < candidateEnd {
+            if isCancelled() { throw CancellationError() }
+            let end = min(candidateEnd, cursor + chunkSize)
+            // Each chunk owns match starts in [cursor, end). The extra bytes let
+            // matches span chunk boundaries without counting any hit twice.
+            let data = try readRawBytes(in: cursor..<(end + length - 1))
+            var start = data.startIndex
+            while let match = data.range(of: query, in: start..<data.endIndex) {
+                if isCancelled() { throw CancellationError() }
+                guard cursor + UInt64(match.lowerBound) < end else { break }
+                count += 1
+                start = data.index(after: match.lowerBound) // Include overlapping hits, like find().
+            }
+            cursor = end
+        }
+        return count
+    }
+
     private func findForwards(
         _ query: Data,
         from offset: UInt64,

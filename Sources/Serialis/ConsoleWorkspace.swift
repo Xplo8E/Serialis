@@ -36,6 +36,21 @@ final class ConsoleWorkspace: ConsolePanel {
     var inspectorVisible = false { didSet { needsLayout = true } }
     var searchVisible = false { didSet { needsLayout = true } }
     var messageVisible = false { didSet { needsLayout = true } }
+    var showingHistory = false {
+        didSet {
+            guard showingHistory != oldValue else { return }
+            // History's primary action replaces Pause in the header (Figma screen 05).
+            // Live scrolling keeps Jump to Latest in the status banner.
+            pauseButton.isHidden = showingHistory
+            jumpButton.removeFromSuperview()
+            (showingHistory ? sessionHeader : messageBar).addSubview(jumpButton)
+            jumpButton.symbol = showingHistory ? "arrow.right" : "arrow.down"
+            jumpButton.symbolAfterTitle = showingHistory
+            jumpButton.accented = showingHistory
+            jumpButton.needsDisplay = true
+            needsLayout = true
+        }
+    }
     let logView: NSView
     let inspector: NSView
     private let appName = ConsoleTheme.label("Serialis", size: 14, weight: .semibold)
@@ -152,7 +167,9 @@ final class ConsoleWorkspace: ConsolePanel {
         messageBar.isHidden = !messageVisible
         messageBar.frame = NSRect(x: side, y: y, width: mainWidth, height: 34)
         positionLabel.frame = NSRect(x: 18, y: 9, width: max(0, mainWidth - 180), height: 17)
-        jumpButton.frame = NSRect(x: mainWidth - 150, y: 3, width: 138, height: 28)
+        jumpButton.frame = showingHistory
+            ? NSRect(x: mainWidth - 230, y: 19, width: 154, height: 32)
+            : NSRect(x: mainWidth - 150, y: 3, width: 138, height: 28)
         if messageVisible { y += 34 }
         logView.frame = NSRect(x: side, y: y, width: mainWidth - inspectorWidth, height: max(0, height - y - 28))
         inspector.isHidden = !inspectorVisible

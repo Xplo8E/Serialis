@@ -43,10 +43,10 @@ Click the sun/moon button immediately left of **Settings** to switch between lig
 
 Scrolling up or selecting text stops automatic scrolling. New data still becomes part of the session. **Jump to Latest** resumes following. Opening a saved session also leaves current capture running; **Return to Live** restores the live view.
 
-- Search is literal, case-sensitive UTF-8 text. Return or **Next** finds the next match; **Previous** searches backward. Both wrap at the end.
+- Search is literal, case-sensitive UTF-8 text. Return or **Next** finds the next match; **Previous** searches backward. Both wrap at the end. The counter shows your position, such as **3 of 24 matches**. New captured matches update the total without moving the current result. Paste into the search field with `⌘V`.
 - `⌘F` opens the search bar and focuses search, `⌘G` finds next, and `⇧⌘G` finds previous.
 - Logs wrap to the available width and reflow when the window, sidebar, or inspector changes size.
-- Drag to select text within or across lines, then `⌘C` to copy. A plain click replaces the previous selection; Shift-click extends it. Double-click selects a word, triple-click selects a line.
+- Drag to select text within or across lines, then `⌘C` or right-click **Copy** to copy. A plain click replaces the previous selection; Shift-click extends it. Double-click selects a word, triple-click selects a line.
 - Double-click an empty area of the top bar to maximize the window; double-click again to restore its previous size.
 - `⌘E` exports selected text as their original bytes. Selections over 16 MiB are offered as an export to avoid a large clipboard allocation.
 - Rows longer than 16 KiB are split for display. Invalid UTF-8 is replaced visually; raw bytes remain unchanged. Serialis is a log viewer and does not emulate ANSI terminal escape sequences.

@@ -32,7 +32,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     private var attemptedDevice: SerialDevice?
     private var paused = false
     private var viewingHistory = false
-    private var lastMatch: Range<UInt64>?
+    private var searchResult: SessionSearchResult?
     private var lastQuery = ""
     private var searchTask: DispatchWorkItem?
     private let smokeTest = CommandLine.arguments.contains("--ui-smoke")
@@ -87,6 +87,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         let edit = NSMenuItem()
         edit.submenu = NSMenu(title: "Edit")
         edit.submenu?.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.submenu?.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.submenu?.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         let export = edit.submenu!.addItem(withTitle: "Export Selected Text…", action: #selector(LogViewController.exportSelection(_:)), keyEquivalent: "e")
         export.target = log
@@ -233,6 +234,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         updateElapsed()
         updatePosition()
         if Date().timeIntervalSince(inspectorUpdatedAt) >= 1 { updateInspector() }
+        refreshSearchCount()
     }
 
     private func updateSessionHeading() {
@@ -273,6 +275,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
             catch { showError(error) }
         }
         updatePosition()
+        refreshSearchCount()
     }
     @objc private func jumpLatest() {
         if viewingHistory { sidebar.selectRowIndexes(IndexSet(integer: liveRow), byExtendingSelection: false) }
@@ -285,11 +288,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
 
     private func updatePosition() {
         guard workspace != nil else { return }
+        workspace.showingHistory = viewingHistory
         let disconnected = latest?.device == nil && (latest?.snapshot.metadata.segments.isEmpty == false)
         workspace.messageBar.color = disconnected || latest?.isError == true ? ConsoleTheme.warning : ConsoleTheme.banner
         workspace.messageBar.needsDisplay = true
         positionLabel.textColor = disconnected || latest?.isError == true ? ConsoleTheme.warningText : ConsoleTheme.accent
         jumpButton.isHidden = false
+        jumpButton.title = "Jump to Latest"
         if viewingHistory {
             positionLabel.stringValue = "Viewing a saved session · current capture continues"
             jumpButton.title = "Return to Live"
@@ -305,7 +310,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
             positionLabel.stringValue = "Reading earlier logs · capture continues"
             jumpButton.title = "Jump to Latest"
         }
-        workspace.messageVisible = viewingHistory || paused || !log.followsLatest || disconnected || latest?.isError == true
+        workspace.messageVisible = !viewingHistory && (paused || !log.followsLatest || disconnected || latest?.isError == true)
         pauseButton.isEnabled = !viewingHistory
     }
 
@@ -366,7 +371,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
               case .session(let saved) = sidebarItems[sidebar.selectedRow] else { return }
         activeSearchCancellation?.cancel()
         searchTask?.cancel()
-        lastMatch = nil
+        searchResult = nil
+        searchTask = nil
         log.highlightedQuery = nil
         searchStatus.stringValue = ""
         paused = false
@@ -404,10 +410,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         workspace.searchVisible = true
         workspace.layoutSubtreeIfNeeded()
         window.makeFirstResponder(searchField)
+        refreshSearchCount()
     }
     @objc private func closeSearch() {
         activeSearchCancellation?.cancel()
         searchTask?.cancel()
+        searchTask = nil
         workspace.searchVisible = false
         log.highlightedQuery = nil
         window.makeFirstResponder(log.canvas)
@@ -415,40 +423,55 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     @objc private func toggleSidebar() { workspace.sidebarVisible.toggle() }
     @objc private func findNext() { search(backwards: false) }
     @objc private func findPrevious() { search(backwards: true) }
-    private func search(backwards: Bool) {
+    private func refreshSearchCount() {
+        guard workspace.searchVisible, searchTask == nil, let result = searchResult,
+              searchField.stringValue == lastQuery, let snapshot = log.snapshot,
+              result.directory == snapshot.directory, result.byteCount < snapshot.byteCount else { return }
+        search(backwards: false, advance: false)
+    }
+
+    private func search(backwards: Bool, advance: Bool = true) {
         activeSearchCancellation?.cancel()
         searchTask?.cancel()
+        searchTask = nil
         let query = searchField.stringValue
-        log.highlightedQuery = query
-        guard !query.isEmpty, let reader = log.reader, let snapshot = log.snapshot else { return }
+        log.highlightedQuery = query.isEmpty ? nil : query
+        if query != lastQuery { searchResult = nil; lastQuery = query }
+        guard !query.isEmpty, let reader = log.reader, let snapshot = log.snapshot else {
+            searchStatus.stringValue = ""
+            return
+        }
         guard query.utf8.count <= 65536 else { searchStatus.stringValue = "Search text is too long"; return }
-        if query != lastQuery { lastMatch = nil; lastQuery = query }
-        let prior = lastMatch
-        let start = backwards ? (prior.map { $0.lowerBound > 0 ? $0.lowerBound - 1 : snapshot.byteCount } ?? snapshot.byteCount) : (prior.map { $0.lowerBound + 1 } ?? 0)
-        searchStatus.stringValue = "Searching…"
+        let previous = searchResult
+        if advance { searchStatus.stringValue = "Searching…" }
         let cancellation = SearchCancellation()
-        // A separate token avoids a work item retaining itself through its own closure.
+        // Counting and navigation stay off the UI thread; the result holds only
+        // a count and one selected range, even when a log has millions of hits.
         let task = DispatchWorkItem { [weak self] in
             do {
-                var match = try reader.find(Data(query.utf8), from: start, backwards: backwards,
-                    snapshot: snapshot, isCancelled: { cancellation.isCancelled })
-                if match == nil, !cancellation.isCancelled {
-                    match = try reader.find(Data(query.utf8), from: backwards ? snapshot.byteCount : 0,
-                        backwards: backwards, snapshot: snapshot, isCancelled: { cancellation.isCancelled })
-                }
-                guard !cancellation.isCancelled else { return }
+                let result = try reader.search(Data(query.utf8), previous: previous, backwards: backwards,
+                    advance: advance, snapshot: snapshot, isCancelled: { cancellation.isCancelled })
                 DispatchQueue.main.async {
-                    guard let self, self.log.snapshot?.directory == snapshot.directory, self.lastQuery == query,
-                          !cancellation.isCancelled else { return }
-                    self.lastMatch = match
-                    self.searchStatus.stringValue = match.map { "Match at byte \($0.lowerBound)" } ?? "No matches"
-                    if let match { do { try self.log.reveal(match) } catch { self.showError(error) } }
+                    guard let self, self.log.snapshot?.directory == snapshot.directory,
+                          self.searchField.stringValue == query, !cancellation.isCancelled else { return }
+                    self.searchTask = nil
+                    self.searchResult = result
+                    let noun = result.total == 1 ? "match" : "matches"
+                    self.searchStatus.stringValue = result.total == 0 ? "No matches" : "\(result.number) of \(result.total) \(noun)"
+                    if let match = result.match, advance || previous?.match != match {
+                        do { try self.log.reveal(match) } catch { self.showError(error) }
+                    }
+                    self.refreshSearchCount()
                 }
             } catch {
-                DispatchQueue.main.async { [weak self] in self?.searchStatus.stringValue = error.localizedDescription }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, !cancellation.isCancelled, self.searchField.stringValue == query,
+                          self.log.snapshot?.directory == snapshot.directory else { return }
+                    self.searchTask = nil
+                    self.searchStatus.stringValue = error.localizedDescription
+                }
             }
         }
-        activeSearchCancellation?.cancel()
         activeSearchCancellation = cancellation
         searchTask = task
         searchQueue.async(execute: task)
@@ -569,12 +592,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
                 if state == "search" {
                     focusSearch()
                     searchField.stringValue = "AppleCredentialManager"
-                    log.highlightedQuery = searchField.stringValue
-                    if let reader = log.reader, let snapshot = log.snapshot,
-                       let match = try reader.find(Data(searchField.stringValue.utf8), from: 0, backwards: false, snapshot: snapshot, isCancelled: { false }) {
-                        try log.reveal(match)
-                        searchStatus.stringValue = "Match at byte \(match.lowerBound)"
-                    }
+                    findNext()
+                    let deadline = Date().addingTimeInterval(3)
+                    while searchTask != nil && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+                    precondition(searchStatus.stringValue == "1 of 30 matches", "Search must display the current hit and total")
+                    findPrevious()
+                    while searchTask != nil && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+                    precondition(searchStatus.stringValue == "30 of 30 matches", "Previous must wrap to the last numbered hit")
+                    findNext()
+                    while searchTask != nil && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+                    precondition(searchStatus.stringValue == "1 of 30 matches", "Next must wrap to the first numbered hit")
+                    precondition(NSApp.target(forAction: #selector(NSText.paste(_:))) != nil,
+                                 "Paste must resolve to the focused search field's native editor")
+                    let pasteItem = NSApp.mainMenu?.items.flatMap { $0.submenu?.items ?? [] }
+                        .first { $0.action == #selector(NSText.paste(_:)) }
+                    precondition(pasteItem?.keyEquivalent == "v" && pasteItem?.keyEquivalentModifierMask.contains(.command) == true,
+                                 "The Edit menu must register Command-V for Paste")
+                    print("Search smoke passed: match count, next/previous wrap, native Paste target")
                 }
                 if state == "history" {
                     sidebar.selectRowIndexes(IndexSet(integer: sidebarItems.count - 1), byExtendingSelection: false)
@@ -584,6 +618,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
                     }
                     precondition(viewingHistory && log.snapshot?.directory == sessions.last?.directory,
                                  "Selecting a grouped history row must load that saved session")
+                    precondition(jumpButton.superview === workspace.sessionHeader && pauseButton.isHidden && !workspace.messageVisible,
+                                 "History must put Return to Live in the header without a duplicate banner")
                 }
                 if state == "disconnected" {
                     received(CaptureUpdate(snapshot: writer.snapshot, status: "Interface disconnected", device: nil, isError: false))
@@ -613,9 +649,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
                 let filename = "UI-\(appearance)-\(state)\(CommandLine.arguments.contains("--toggle-theme") ? "-toggled" : "")\(CommandLine.arguments.contains("--compact") ? "-compact" : "").png"
                 try savePreview(filename)
                 if state == "history" {
-                    jumpLatest()
+                    jumpButton.performClick(nil)
                     precondition(!viewingHistory && log.snapshot?.directory == latest?.snapshot.directory,
                                  "Return to Live must restore the active session")
+                    precondition(jumpButton.superview === workspace.messageBar && !pauseButton.isHidden && !jumpButton.accented,
+                                 "Returning to live must restore the normal header and Jump to Latest banner action")
                     print("History smoke passed: grouped selection, background load, return to live")
                 }
             }

@@ -63,6 +63,7 @@ class ConsolePanel: NSView {
 final class ConsoleButton: NSButton {
     var symbol: String? { didSet { needsDisplay = true } }
     var outlined = false
+    var accented = false
     var symbolAfterTitle = false
     private var hovered = false
     private var tracking: NSTrackingArea?
@@ -87,12 +88,16 @@ final class ConsoleButton: NSButton {
     override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
     override func draw(_ dirtyRect: NSRect) {
         let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 5, yRadius: 5)
-        if outlined || hovered || cell?.isHighlighted == true {
-            (cell?.isHighlighted == true ? ConsoleTheme.selection : (hovered ? ConsoleTheme.sidebar : ConsoleTheme.background)).setFill()
+        if accented || outlined || hovered || cell?.isHighlighted == true {
+            let fill: NSColor
+            if cell?.isHighlighted == true || (accented && hovered) { fill = ConsoleTheme.selection }
+            else if hovered { fill = ConsoleTheme.sidebar }
+            else { fill = accented ? ConsoleTheme.banner : ConsoleTheme.background }
+            fill.setFill()
             shape.fill()
         }
         if outlined { ConsoleTheme.border.setStroke(); shape.stroke() }
-        let tint = isEnabled ? ConsoleTheme.secondary : ConsoleTheme.tertiary
+        let tint = isEnabled ? (accented ? ConsoleTheme.accent : ConsoleTheme.secondary) : ConsoleTheme.tertiary
         let attributes: [NSAttributedString.Key: Any] = [.font: font!, .foregroundColor: tint]
         let textSize = (title as NSString).size(withAttributes: attributes)
         let iconWidth: CGFloat = symbol == nil ? 0 : 16

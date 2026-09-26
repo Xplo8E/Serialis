@@ -295,6 +295,18 @@ final class WrappedLogView: NSView {
     }
 
     @objc func copy(_ sender: Any?) { onCopy?() }
+    override func menu(for event: NSEvent) -> NSMenu? {
+        window?.makeFirstResponder(self)
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let copy = menu.addItem(withTitle: "Copy", action: #selector(WrappedLogView.copy(_:)), keyEquivalent: "")
+        copy.target = self
+        copy.isEnabled = selection != nil
+        let selectAll = menu.addItem(withTitle: "Select All", action: #selector(WrappedLogView.selectAll(_:)), keyEquivalent: "")
+        selectAll.target = self
+        selectAll.isEnabled = (snapshot?.rowCount ?? 0) > 0
+        return menu
+    }
     override func selectAll(_ sender: Any?) {
         guard let snapshot, snapshot.rowCount > 0, let reader else { return }
         do {

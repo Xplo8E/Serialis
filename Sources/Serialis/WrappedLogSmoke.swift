@@ -38,6 +38,12 @@ enum WrappedLogSmoke {
 
         select(LogPosition(row: 0, column: 6), LogPosition(row: 0, column: 11))
         check(try selectedText() == "bravo", "Dragging inside one line must select only those characters")
+        let rightClick = NSEvent.mouseEvent(with: .rightMouseDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        let copyItem = log.canvas.menu(for: rightClick)?.item(withTitle: "Copy")
+        check(copyItem?.isEnabled == true && copyItem?.target === log.canvas,
+              "The log context menu must offer Copy for selected text")
+        check(try selectedText() == "bravo", "Opening the context menu must preserve the selection")
         // Reflow must keep the original bytes selected, not the previous visual row number.
         window.setContentSize(NSSize(width: 1280, height: 800))
         window.contentView?.layoutSubtreeIfNeeded()
@@ -47,6 +53,8 @@ enum WrappedLogSmoke {
         log.canvas.scrollToRow(3)
         log.canvas.beginSelection(at: log.canvas.point(for: LogPosition(row: 3, column: 4))!, extending: false)
         check(log.canvas.selection == nil && log.canvas.caret?.row == 3, "A plain click must replace the old selection")
+        check(log.canvas.menu(for: rightClick)?.item(withTitle: "Copy")?.isEnabled == false,
+              "Context Copy must be disabled without selected text")
         log.canvas.moveRightAndModifySelection(nil)
         check(try selectedText() == "c", "Shift-arrow must extend the caret by one character")
 
