@@ -5,18 +5,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     private var window: NSWindow!
     private let log = LogViewController()
     private let sidebar = NSTableView()
-    private let titleLabel = NSTextField(labelWithString: "Live session")
-    private let detailLabel = NSTextField(labelWithString: "Waiting for serial data")
-    private let statusLabel = NSTextField(labelWithString: "Starting capture…")
-    private let positionLabel = NSTextField(labelWithString: "Following latest")
-    private let pauseButton = NSButton(title: "Pause Display", target: nil, action: nil)
-    private let jumpButton = NSButton(title: "Jump to Latest", target: nil, action: nil)
-    private let searchField = NSSearchField()
-    private let searchStatus = NSTextField(labelWithString: "")
-    private let inspectorScroll = NSScrollView()
-    private let inspectorText = NSTextView()
-    private let picker = NSPopUpButton()
-    private let pickerDetail = NSTextField(wrappingLabelWithString: "")
+    private var workspace: ConsoleWorkspace!
+    private let inspector = SessionInspectorView(frame: .zero)
+    private let picker = InterfacePickerView(frame: .zero)
+    private var titleLabel: NSTextField { workspace.titleLabel }
+    private var detailLabel: NSTextField { workspace.detailLabel }
+    private var statusLabel: NSTextField { workspace.statusLabel }
+    private var positionLabel: NSTextField { workspace.positionLabel }
+    private var pauseButton: ConsoleButton { workspace.pauseButton }
+    private var jumpButton: ConsoleButton { workspace.jumpButton }
+    private var searchField: NSSearchField { workspace.searchField }
+    private var searchStatus: NSTextField { workspace.searchStatus }
+    private var elapsedTimer: Timer?
+    private var inspectorUpdatedAt = Date.distantPast
+    // A nil snapshot is the current session; headings cannot be selected.
+    private enum SidebarItem { case heading(String), session(SessionSnapshot?) }
+    private var sidebarItems: [SidebarItem] = [.heading("Today"), .session(nil)]
+    private let liveRow = 1
     private let settingsPopover = NSPopover()
     private let discovery = DeviceDiscovery()
     private var capture: CaptureController!
@@ -56,7 +61,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
             if !smokeTest { capture.start(); discovery.start() }
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
-            if smokeTest { DispatchQueue.main.async { self.runUISmokeTest() } }
+            if smokeTest { Task { @MainActor in await self.runUISmokeTest() } }
         } catch {
             NSAlert(error: error).runModal()
             NSApp.terminate(nil)
@@ -66,6 +71,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     func applicationWillTerminate(_ notification: Notification) {
         activeSearchCancellation?.cancel()
         searchTask?.cancel()
+        elapsedTimer?.invalidate()
         capture?.stop()
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -82,7 +88,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         edit.submenu = NSMenu(title: "Edit")
         edit.submenu?.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.submenu?.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        let export = edit.submenu!.addItem(withTitle: "Export Selected Rows…", action: #selector(LogViewController.exportSelection(_:)), keyEquivalent: "e")
+        let export = edit.submenu!.addItem(withTitle: "Export Selected Text…", action: #selector(LogViewController.exportSelection(_:)), keyEquivalent: "e")
         export.target = log
         menu.addItem(edit)
         let find = NSMenuItem()
@@ -98,182 +104,159 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         NSApp.mainMenu = menu
     }
 
-    private func button(_ title: String, _ action: Selector) -> NSButton {
-        let button = NSButton(title: title, target: self, action: action)
-        button.bezelStyle = .rounded
-        button.controlSize = .small
-        return button
-    }
-
     private func buildWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1240, height: 790),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        if !smokeTest, let saved = UserDefaults.standard.string(forKey: "preferredAppearance") {
+            if saved == "light" { NSApp.appearance = NSAppearance(named: .aqua) }
+            if saved == "dark" { NSApp.appearance = NSAppearance(named: .darkAqua) }
+        }
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 800),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered, defer: false)
         window.title = "Serialis"
-        window.minSize = NSSize(width: 900, height: 540)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = false
+        window.minSize = NSSize(width: 960, height: 540)
         window.center()
-        window.setFrameAutosaveName("Serialis.main")
-        let content = NSStackView()
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 0
-        window.contentView = content
+        if !smokeTest { window.setFrameAutosaveName("Serialis.main") }
+        if smokeTest, CommandLine.arguments.contains("dark") { window.appearance = NSAppearance(named: .darkAqua) }
+        if smokeTest, CommandLine.arguments.contains("light") { window.appearance = NSAppearance(named: .aqua) }
 
-        titleLabel.font = .systemFont(ofSize: 18, weight: .semibold)
-        detailLabel.font = .systemFont(ofSize: 11)
-        detailLabel.textColor = .secondaryLabelColor
-        let headings = NSStackView(views: [titleLabel, detailLabel])
-        headings.orientation = .vertical
-        headings.alignment = .leading
-        headings.spacing = 3
-        pauseButton.target = self
-        pauseButton.action = #selector(togglePause)
-        pauseButton.bezelStyle = .rounded
-        jumpButton.target = self
-        jumpButton.action = #selector(jumpLatest)
-        jumpButton.bezelStyle = .rounded
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let header = NSStackView(views: [headings, spacer, pauseButton,
-            button("Inspector", #selector(toggleInspector)), button("Settings", #selector(showSettings(_:)))])
-        header.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
-        content.addArrangedSubview(header)
-
-        searchField.placeholderString = "Find in session · exact text"
-        searchField.target = self
-        searchField.action = #selector(findNext)
-        searchField.sendsSearchStringImmediately = false
-        searchField.sendsWholeSearchString = true
-        searchField.widthAnchor.constraint(equalToConstant: 280).isActive = true
-        searchStatus.font = .systemFont(ofSize: 11)
-        searchStatus.textColor = .secondaryLabelColor
-        let searchBar = NSStackView(views: [searchField, button("Previous", #selector(findPrevious)),
-            button("Next", #selector(findNext)), searchStatus, NSView(), jumpButton])
-        searchBar.edgeInsets = NSEdgeInsets(top: 0, left: 20, bottom: 12, right: 20)
-        content.addArrangedSubview(searchBar)
-
-        let sessionColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("session"))
-        sessionColumn.width = 190
-        sidebar.addTableColumn(sessionColumn)
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("session"))
+        column.width = 208
+        sidebar.addTableColumn(column)
         sidebar.headerView = nil
-        sidebar.rowHeight = 54
-        sidebar.style = .sourceList
+        sidebar.rowHeight = 60
+        sidebar.intercellSpacing = .zero
+        sidebar.style = .plain
+        sidebar.backgroundColor = ConsoleTheme.sidebar
+        sidebar.selectionHighlightStyle = .regular
         sidebar.dataSource = self
         sidebar.delegate = self
         sidebar.setAccessibilityLabel("Sessions")
-        let sidebarScroll = NSScrollView()
-        sidebarScroll.documentView = sidebar
-        sidebarScroll.hasVerticalScroller = true
-        let sidebarHeading = NSTextField(labelWithString: "SESSIONS")
-        sidebarHeading.font = .systemFont(ofSize: 10, weight: .semibold)
-        sidebarHeading.textColor = .secondaryLabelColor
-        let side = NSStackView(views: [sidebarHeading, sidebarScroll, button("Open Sessions Folder", #selector(openSessionsFolder))])
-        side.orientation = .vertical
-        side.alignment = .leading
-        side.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
-        side.widthAnchor.constraint(equalToConstant: 215).isActive = true
-        sidebarScroll.widthAnchor.constraint(equalTo: side.widthAnchor, constant: -24).isActive = true
-
-        inspectorText.isEditable = false
-        inspectorText.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        inspectorText.textContainerInset = NSSize(width: 12, height: 12)
-        inspectorText.isHorizontallyResizable = false
-        inspectorText.autoresizingMask = [.width]
-        inspectorText.textContainer?.widthTracksTextView = true
-        inspectorScroll.documentView = inspectorText
-        inspectorScroll.hasVerticalScroller = true
-        inspectorScroll.widthAnchor.constraint(equalToConstant: 280).isActive = true
-        inspectorScroll.isHidden = true
-        let body = NSStackView(views: [side, log.view, inspectorScroll])
-        body.alignment = .top
-        body.spacing = 1
-        content.addArrangedSubview(body)
-        for child in [side, log.view, inspectorScroll] {
-            child.heightAnchor.constraint(equalTo: body.heightAnchor).isActive = true
-        }
-        log.view.widthAnchor.constraint(greaterThanOrEqualToConstant: 400).isActive = true
+        rebuildSidebar()
+        workspace = ConsoleWorkspace(logView: log.view, sidebar: sidebar, inspector: inspector)
+        window.contentView = workspace
+        workspace.installWindowButtons(from: window)
+        let actions: [(NSButton, Selector)] = [
+            (pauseButton, #selector(togglePause)), (jumpButton, #selector(jumpLatest)),
+            (workspace.settingsButton, #selector(showSettings(_:))),
+            (workspace.themeButton, #selector(toggleTheme)),
+            (workspace.findButton, #selector(focusSearch)),
+            (workspace.inspectorButton, #selector(toggleInspector)),
+            (workspace.sidebarButton, #selector(toggleSidebar)),
+            (workspace.folderButton, #selector(openSessionsFolder)),
+            (workspace.previousButton, #selector(findPrevious)),
+            (workspace.nextButton, #selector(findNext)),
+            (workspace.closeSearchButton, #selector(closeSearch))
+        ]
+        for (button, action) in actions { button.target = self; button.action = action }
+        searchField.target = self
+        searchField.action = #selector(findNext)
         log.onPositionChange = { [weak self] in self?.updatePosition() }
-
-        statusLabel.font = .systemFont(ofSize: 11, weight: .medium)
-        statusLabel.lineBreakMode = .byTruncatingMiddle
-        positionLabel.font = .systemFont(ofSize: 11)
-        positionLabel.textColor = .secondaryLabelColor
-        let footer = NSStackView(views: [statusLabel, NSView(), positionLabel])
-        footer.edgeInsets = NSEdgeInsets(top: 10, left: 20, bottom: 10, right: 20)
-        content.addArrangedSubview(footer)
-        for child in [header, searchBar, body, footer] {
-            child.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-        }
-        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        inspector.onClose = { [weak self] in self?.workspace.inspectorVisible = false }
+        sidebar.selectRowIndexes(IndexSet(integer: liveRow), byExtendingSelection: false)
         buildSettings()
+        elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.updateElapsed() }
+    }
+
+    @objc private func toggleTheme() {
+        let dark = window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let appearance = NSAppearance(named: dark ? .aqua : .darkAqua)
+        // Apply to the whole app, including the interface popover and file panels.
+        NSApp.appearance = appearance
+        window.appearance = appearance
+        settingsPopover.appearance = appearance
+        // AppKit recreates its title-bar controls when the window appearance changes.
+        workspace.installWindowButtons(from: window)
+        if !smokeTest { UserDefaults.standard.set(dark ? "light" : "dark", forKey: "preferredAppearance") }
+        workspace.updateThemeButton()
     }
 
     private func buildSettings() {
-        let heading = NSTextField(labelWithString: "Serial interface")
-        heading.font = .systemFont(ofSize: 14, weight: .semibold)
-        picker.target = self
-        picker.action = #selector(chooseDevice)
-        pickerDetail.font = .systemFont(ofSize: 11)
-        pickerDetail.textColor = .secondaryLabelColor
-        let baud = NSTextField(labelWithString: "115200 baud · 8 data bits · no parity · 1 stop bit")
-        baud.font = .systemFont(ofSize: 10)
-        let controls = NSStackView(views: [button("Refresh", #selector(refreshDevices)), button("Retry", #selector(retryDevice))])
-        let stack = NSStackView(views: [heading, picker, pickerDetail, baud, controls])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
-        picker.widthAnchor.constraint(equalToConstant: 300).isActive = true
-        pickerDetail.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        picker.onSelect = { [weak self] device in
+            guard let self else { return }
+            self.selectedID = device.stableID
+            self.attemptedDevice = nil
+            self.devicesChanged(self.devices)
+        }
+        picker.onRefresh = { [weak self] in self?.discovery.refresh() }
+        picker.onRetry = { [weak self] in self?.retryDevice() }
         let controller = NSViewController()
-        controller.view = stack
+        controller.view = picker
         settingsPopover.contentViewController = controller
-        settingsPopover.contentSize = NSSize(width: 340, height: 235)
+        settingsPopover.contentSize = NSSize(width: 340, height: 250)
         settingsPopover.behavior = .transient
     }
 
+    private func updatePicker() {
+        picker.update(devices: devices, selectedID: selectedID, activeID: latest?.device?.stableID,
+                      error: latest?.isError == true ? latest?.status : nil)
+    }
+
+    private func updateElapsed() {
+        guard let startedAt = latest?.snapshot.metadata.startedAt else { return }
+        let seconds = max(0, Int(Date().timeIntervalSince(startedAt)))
+        workspace.elapsedLabel.stringValue = String(format: "%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+    }
+
+    private func sessionTitle(_ snapshot: SessionSnapshot) -> String {
+        let date = snapshot.metadata.startedAt
+        let day = Calendar.current.isDateInToday(date) ? "Today" : date.formatted(date: .abbreviated, time: .omitted)
+        return "\(day), \(date.formatted(date: .omitted, time: .shortened))"
+    }
+
     private func received(_ update: CaptureUpdate) {
+        let previousDevice = latest?.device
+        let previousError = latest?.isError
         latest = update
-        statusLabel.stringValue = "\(update.device == nil ? "○" : "●") \(update.status) · \(formatBytes(update.snapshot.byteCount)) saved"
-        statusLabel.textColor = update.isError ? .systemRed : .secondaryLabelColor
+        let connected = update.device != nil && !update.isError
+        statusLabel.stringValue = connected ? "●  Interface connected" : (update.isError ? "●  Capture error" : "○  Waiting for interface")
+        statusLabel.textColor = update.isError ? .systemRed : ConsoleTheme.secondary
+        statusLabel.toolTip = update.status
+        workspace.captureLabel.stringValue = connected ? "●  Capturing" : (update.isError ? "●  Capture error" : "○  Waiting")
+        workspace.captureLabel.textColor = connected ? ConsoleTheme.green : ConsoleTheme.secondary
+        workspace.recordingLabel.stringValue = connected ? "Raw recording active" : "Raw recording idle"
+        workspace.recordingLabel.textColor = connected ? ConsoleTheme.green : ConsoleTheme.secondary
+        workspace.savedLabel.stringValue = "\(formatBytes(update.snapshot.byteCount)) captured"
+        workspace.deviceName.stringValue = update.device?.product ?? "Serial interface"
+        workspace.deviceDetail.stringValue = connected ? "Connected · 115200 baud" : "Not connected · 115200 baud"
         if !viewingHistory && !paused {
             do { try log.show(update.snapshot) }
             catch { showError(error) }
         }
-        detailLabel.stringValue = viewingHistory ? "Saved session · live capture continues" : "\(update.snapshot.directory.lastPathComponent) · raw bytes saved automatically"
+        updateSessionHeading()
+        if let cell = sidebar.view(atColumn: 0, row: liveRow, makeIfNecessary: false) as? SessionCell {
+            configure(cell, snapshot: update.snapshot, live: true)
+        }
+        if previousDevice != update.device || previousError != update.isError { updatePicker() }
+        updateElapsed()
         updatePosition()
-        updateInspector()
+        if Date().timeIntervalSince(inspectorUpdatedAt) >= 1 { updateInspector() }
+    }
+
+    private func updateSessionHeading() {
+        guard let snapshot = viewingHistory ? log.snapshot : latest?.snapshot else { return }
+        titleLabel.stringValue = sessionTitle(snapshot)
+        detailLabel.stringValue = "\(viewingHistory ? "Saved session" : "Current session") · \(formatBytes(snapshot.byteCount)) captured"
     }
 
     private func devicesChanged(_ connected: [SerialDevice]) {
         devices = connected
         // A remembered board that is absent must never be replaced by a different board.
         if selectedID == nil, connected.count == 1 { selectedID = connected[0].stableID }
-        let chosen = connected.first { $0.stableID == selectedID }
-        picker.removeAllItems()
-        picker.addItem(withTitle: chosen == nil ? "Choose a supported interface…" : "Select interface…")
-        for device in connected {
-            picker.addItem(withTitle: "\(device.product) · …\(device.serialNumber.suffix(6))")
-        }
-        if let chosen, let index = connected.firstIndex(of: chosen) {
-            picker.selectItem(at: index + 1)
-            pickerDetail.stringValue = "\(chosen.path)\nSerial: \(chosen.serialNumber)"
+        if let chosen = connected.first(where: { $0.stableID == selectedID }) {
             if attemptedDevice != chosen {
                 attemptedDevice = chosen
                 capture.connect(chosen)
             }
-        } else {
-            pickerDetail.stringValue = connected.isEmpty ? "No supported interfaces connected. Your selected interface will reconnect automatically." : "Choose the interface to capture. The selection is remembered."
-            if attemptedDevice != nil { capture.disconnected(); attemptedDevice = nil }
+        } else if attemptedDevice != nil {
+            capture.disconnected()
+            attemptedDevice = nil
         }
+        updatePicker()
     }
 
-    @objc private func chooseDevice() {
-        let index = picker.indexOfSelectedItem - 1
-        guard devices.indices.contains(index) else { return }
-        selectedID = devices[index].stableID
-        attemptedDevice = nil
-        devicesChanged(devices)
-    }
     @objc private func refreshDevices() { discovery.refresh() }
     @objc private func retryDevice() { attemptedDevice = nil; discovery.refresh() }
     @objc private func showSettings(_ sender: NSButton) {
@@ -284,6 +267,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         guard !viewingHistory else { return }
         paused.toggle()
         pauseButton.title = paused ? "Resume Display" : "Pause Display"
+        pauseButton.symbol = paused ? "play" : "pause"
         if !paused, let latest {
             do { try log.show(latest.snapshot, follow: true); log.jumpToLatest() }
             catch { showError(error) }
@@ -291,48 +275,106 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         updatePosition()
     }
     @objc private func jumpLatest() {
-        if viewingHistory { sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
+        if viewingHistory { sidebar.selectRowIndexes(IndexSet(integer: liveRow), byExtendingSelection: false) }
         paused = false
         pauseButton.title = "Pause Display"
+        pauseButton.symbol = "pause"
         if let latest { try? log.show(latest.snapshot, follow: true) }
         log.jumpToLatest()
     }
 
     private func updatePosition() {
+        guard workspace != nil else { return }
+        let disconnected = latest?.device == nil && (latest?.snapshot.metadata.segments.isEmpty == false)
+        workspace.messageBar.color = disconnected || latest?.isError == true ? ConsoleTheme.warning : ConsoleTheme.banner
+        workspace.messageBar.needsDisplay = true
+        positionLabel.textColor = disconnected || latest?.isError == true ? ConsoleTheme.warningText : ConsoleTheme.accent
+        jumpButton.isHidden = false
         if viewingHistory {
-            positionLabel.stringValue = "Viewing history"
+            positionLabel.stringValue = "Viewing a saved session · current capture continues"
             jumpButton.title = "Return to Live"
+        } else if paused {
+            let bytes = latest?.snapshot.byteCount ?? 0
+            let unseen = bytes - min(bytes, log.snapshot?.byteCount ?? 0)
+            positionLabel.stringValue = "Display paused · \(formatBytes(unseen)) captured since pause"
+            jumpButton.title = "Jump to Latest"
+        } else if latest?.isError == true || disconnected {
+            positionLabel.stringValue = latest?.isError == true ? (latest?.status ?? "Capture error") : "Interface disconnected · waiting to reconnect"
+            jumpButton.isHidden = log.followsLatest
         } else {
-            let unseen = (latest?.snapshot.byteCount ?? 0) - min(latest?.snapshot.byteCount ?? 0, log.snapshot?.byteCount ?? 0)
-            positionLabel.stringValue = paused ? "Display paused · \(formatBytes(unseen)) captured since pause" : (log.followsLatest ? "Following latest" : "Reading earlier rows · capture continues")
+            positionLabel.stringValue = "Reading earlier logs · capture continues"
             jumpButton.title = "Jump to Latest"
         }
+        workspace.messageVisible = viewingHistory || paused || !log.followsLatest || disconnected || latest?.isError == true
         pauseButton.isEnabled = !viewingHistory
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { sessions.count + 1 }
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let field = NSTextField(wrappingLabelWithString: "")
-        field.font = .systemFont(ofSize: 12)
-        if row == 0 { field.stringValue = "Live session\nCurrent capture" }
-        else {
-            let session = sessions[row - 1]
-            field.stringValue = "\(session.metadata.startedAt.formatted(date: .abbreviated, time: .shortened))\n\(formatBytes(session.byteCount))"
+    private func rebuildSidebar() {
+        sidebarItems = [.heading("Today"), .session(nil)]
+        var previousDay = Calendar.current.startOfDay(for: Date())
+        for snapshot in sessions {
+            let day = Calendar.current.startOfDay(for: snapshot.metadata.startedAt)
+            if day != previousDay {
+                let heading = Calendar.current.isDateInYesterday(day) ? "Yesterday" : day.formatted(date: .abbreviated, time: .omitted)
+                sidebarItems.append(.heading(heading))
+                previousDay = day
+            }
+            sidebarItems.append(.session(snapshot))
         }
-        return field
+        sidebar.reloadData()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { sidebarItems.count }
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        if case .heading = sidebarItems[row] { return 30 }
+        return 60
+    }
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        if case .heading = sidebarItems[row] { return false }
+        return true
+    }
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { SessionSelectionRow() }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        switch sidebarItems[row] {
+        case .heading(let title):
+            let view = ConsolePanel()
+            view.color = ConsoleTheme.sidebar
+            let label = ConsoleTheme.label(title, size: 11, color: ConsoleTheme.tertiary)
+            label.frame = NSRect(x: 12, y: 7, width: 180, height: 17)
+            view.addSubview(label)
+            return view
+        case .session(let snapshot):
+            let cell = SessionCell(frame: .zero)
+            configure(cell, snapshot: snapshot ?? latest?.snapshot, live: snapshot == nil)
+            return cell
+        }
+    }
+    private func configure(_ cell: SessionCell, snapshot: SessionSnapshot?, live: Bool) {
+        cell.title.stringValue = snapshot?.metadata.startedAt.formatted(date: .omitted, time: .shortened) ?? "Current session"
+        cell.mark.stringValue = live ? "●" : ""
+        cell.icon.isHidden = live
+        cell.mark.textColor = live ? (latest?.device == nil ? ConsoleTheme.warningText : ConsoleTheme.green) : ConsoleTheme.tertiary
+        let bytes = formatBytes(snapshot?.byteCount ?? 0)
+        if live { cell.detail.stringValue = "\(latest?.device == nil ? "Waiting" : "Live") · \(bytes)" }
+        else if let snapshot {
+            let seconds = max(0, Int((snapshot.metadata.endedAt ?? snapshot.metadata.startedAt).timeIntervalSince(snapshot.metadata.startedAt)))
+            cell.detail.stringValue = "\(seconds / 60)m \(seconds % 60)s · \(bytes)"
+        }
     }
     func tableViewSelectionDidChange(_ notification: Notification) {
+        guard workspace != nil, sidebarItems.indices.contains(sidebar.selectedRow),
+              case .session(let saved) = sidebarItems[sidebar.selectedRow] else { return }
         activeSearchCancellation?.cancel()
         searchTask?.cancel()
         lastMatch = nil
+        log.highlightedQuery = nil
         searchStatus.stringValue = ""
         paused = false
         pauseButton.title = "Pause Display"
+        pauseButton.symbol = "pause"
         let row = sidebar.selectedRow
-        viewingHistory = row > 0
-        let snapshot = row > 0 && row <= sessions.count ? sessions[row - 1] : latest?.snapshot
-        titleLabel.stringValue = viewingHistory ? "Saved session" : "Live session"
-        if viewingHistory, let snapshot {
+        viewingHistory = saved != nil
+        if let snapshot = saved {
             searchStatus.stringValue = "Opening session…"
             log.clear(message: "Opening saved session…")
             historyQueue.async { [weak self] in
@@ -342,6 +384,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
                     do {
                         try self.log.show(result.get(), follow: true)
                         self.searchStatus.stringValue = ""
+                        self.updateSessionHeading()
                         self.updateInspector()
                     } catch {
                         self.showError(error)
@@ -350,20 +393,33 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
                     }
                 }
             }
-        } else if let snapshot {
-            do { try log.show(snapshot, follow: true) } catch { showError(error) }
+        } else if let latest {
+            do { try log.show(latest.snapshot, follow: true) } catch { showError(error) }
         }
-        if let latest { received(latest) }
+        updateSessionHeading()
         updatePosition()
     }
 
-    @objc private func focusSearch() { window.makeFirstResponder(searchField) }
+    @objc private func focusSearch() {
+        workspace.searchVisible = true
+        workspace.layoutSubtreeIfNeeded()
+        window.makeFirstResponder(searchField)
+    }
+    @objc private func closeSearch() {
+        activeSearchCancellation?.cancel()
+        searchTask?.cancel()
+        workspace.searchVisible = false
+        log.highlightedQuery = nil
+        window.makeFirstResponder(log.canvas)
+    }
+    @objc private func toggleSidebar() { workspace.sidebarVisible.toggle() }
     @objc private func findNext() { search(backwards: false) }
     @objc private func findPrevious() { search(backwards: true) }
     private func search(backwards: Bool) {
         activeSearchCancellation?.cancel()
         searchTask?.cancel()
         let query = searchField.stringValue
+        log.highlightedQuery = query
         guard !query.isEmpty, let reader = log.reader, let snapshot = log.snapshot else { return }
         guard query.utf8.count <= 65536 else { searchStatus.stringValue = "Search text is too long"; return }
         if query != lastQuery { lastMatch = nil; lastQuery = query }
@@ -399,33 +455,56 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     }
     private var activeSearchCancellation: SearchCancellation?
 
-    @objc private func toggleInspector() { inspectorScroll.isHidden.toggle(); updateInspector() }
+    @objc private func toggleInspector() { workspace.inspectorVisible.toggle(); updateInspector() }
     private func updateInspector() {
-        guard !inspectorScroll.isHidden, let snapshot = log.snapshot else { return }
-        var text = "SESSION\n\(snapshot.metadata.startedAt.formatted())\n\n\(formatBytes(snapshot.byteCount))\n\(snapshot.rowCount) display rows\n\nFILES\n\(snapshot.directory.path)\n\nINTERFACES\n"
-        for segment in snapshot.metadata.segments {
-            text += "\n\(segment.device.displayName)\n\(segment.device.path)\nBytes \(segment.startOffset)…\(segment.endOffset.map(String.init) ?? "live")\n"
-        }
-        text += "\nEVENTS\n"
-        for event in snapshot.metadata.events.suffix(50) { text += "\(event.date.formatted(date: .omitted, time: .standard))  \(event.message)\n" }
-        inspectorText.string = text
+        guard workspace.inspectorVisible, let snapshot = log.snapshot else { return }
+        inspector.update(snapshot)
+        inspectorUpdatedAt = Date()
     }
     @objc private func openSessionsFolder() { NSWorkspace.shared.open(root) }
     private func showError(_ error: Error) { statusLabel.stringValue = error.localizedDescription; statusLabel.textColor = .systemRed }
-    private func formatBytes(_ count: UInt64) -> String { ByteCountFormatter.string(fromByteCount: Int64(count), countStyle: .file) }
+    private func argument(_ flag: String) -> String? {
+        guard let index = CommandLine.arguments.firstIndex(of: flag), index + 1 < CommandLine.arguments.count else { return nil }
+        return CommandLine.arguments[index + 1]
+    }
+    private func formatBytes(_ count: UInt64) -> String { count == 0 ? "0 B" : ByteCountFormatter.string(fromByteCount: Int64(count), countStyle: .file) }
+
+    private func savePreview(_ filename: String) throws {
+        guard let content = window.contentView,
+              let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) else { return }
+        window.effectiveAppearance.performAsCurrentDrawingAppearance {
+            content.cacheDisplay(in: content.bounds, to: bitmap)
+        }
+        let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("benchmark-results/\(filename)")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try bitmap.representation(using: .png, properties: [:])?.write(to: url)
+        print("Preview: \(url.path)")
+    }
 
     /// Runs against temporary fixtures only; never discovers or opens the user's hardware.
-    private func runUISmokeTest() {
+    @MainActor private func runUISmokeTest() async {
         do {
             let writer = try SessionWriter(rootDirectory: smokeRoot)
-            for index in 0..<150 {
-                try writer.append(Data("[\(index)] Serialis sample · device ready · capture continues\n".utf8))
-            }
-            received(CaptureUpdate(snapshot: writer.snapshot, status: "Synthetic capture", device: nil, isError: false))
+            let sampleDevice = SerialDevice(path: "/dev/cu.usbmodem11101", vendorID: 0x2e8a, productID: 0x00b7,
+                manufacturer: "B4", product: "B4 PICO Ultra", serialNumber: "99EA21A8E17CD666", interfaceNumber: 1)
+            try writer.beginSegment(device: sampleDevice)
+            let sampleLines = ["boot-args: -v wdt=-1 rd=md0 serial=3", "Darwin kernel initializing",
+                "AppleARMPlatform: platform initialization", "IOKit: matching platform services",
+                "AppleSEPManager: starting services", "AppleCredentialManager: service initialized",
+                "IOUSBHostFamily: device enumeration", "USB serial console active", "",
+                "launchd: system bootstrap in progress", "kernel: waiting for root device", "kernel: root device available",
+                "AppleMobileFileIntegrity: loading policy", "AppleCredentialManager: request received",
+                "AppleCredentialManager: request completed", "", "IOKit: service matching complete",
+                "launchd: starting system daemons", "system: entering user space",
+                "AppleCredentialManager: request received", "AppleCredentialManager: request completed", "",
+                "Console stream active", "Waiting for additional serial output…"]
+            for _ in 0..<6 { try writer.append(Data((sampleLines.joined(separator: "\n") + "\n").utf8)) }
+            received(CaptureUpdate(snapshot: writer.snapshot, status: "Synthetic capture", device: sampleDevice, isError: false))
             let before = log.snapshot!.byteCount
             togglePause()
             try writer.append(Data("New bytes while display is paused\n".utf8))
-            received(CaptureUpdate(snapshot: writer.snapshot, status: "Synthetic capture", device: nil, isError: false))
+            received(CaptureUpdate(snapshot: writer.snapshot, status: "Synthetic capture", device: sampleDevice, isError: false))
             precondition(log.snapshot!.byteCount == before, "Pause must freeze the display")
             togglePause()
             precondition(log.snapshot!.byteCount == writer.snapshot.byteCount, "Resume must include paused bytes")
@@ -439,10 +518,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
                 autoreleasepool {
                     if let snapshot = log.snapshot, snapshot.rowCount > 0 {
                         let row = Int(UInt64(index) * (snapshot.rowCount - 1) / 99)
-                        log.table.scrollRowToVisible(row)
-                        log.table.layoutSubtreeIfNeeded()
-                        log.table.displayIfNeeded()
+                        log.canvas.scrollToRow(UInt64(row))
+                        log.canvas.layoutSubtreeIfNeeded()
+                        log.canvas.displayIfNeeded()
                     }
+                }
+                if CommandLine.arguments.contains("--paced-scroll") {
+                    // Let AppKit present each frame, as it does between input events.
+                    try await Task.sleep(nanoseconds: 16_666_667)
                 }
             }
             log.jumpToLatest()
@@ -451,16 +534,90 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
             precondition(log.view.bounds.width > 300, "Log view must have usable width")
             print("UI smoke passed: pause, resume, 100 scroll positions, layout")
             print("Visible log size: \(log.view.bounds.size)")
-            if !CommandLine.arguments.contains("--no-snapshot"), let content = window.contentView,
-               let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
-                window.effectiveAppearance.performAsCurrentDrawingAppearance {
-                    content.cacheDisplay(in: content.bounds, to: bitmap)
+            if CommandLine.arguments.contains("--wrapped-log-smoke") {
+                let wrapped = try WrappedLogSmoke.run(log: log, window: window, root: smokeRoot)
+                latest = CaptureUpdate(snapshot: wrapped, status: "Synthetic capture", device: sampleDevice, isError: false)
+                updateSessionHeading()
+            }
+            if !CommandLine.arguments.contains("--no-snapshot") {
+                let state = argument("--preview-state") ?? "live"
+                let appearance = argument("--appearance") ?? (CommandLine.arguments.contains("dark") ? "dark" : "light")
+                window.appearance = NSAppearance(named: appearance == "dark" ? .darkAqua : .aqua)
+                if CommandLine.arguments.contains("--toggle-theme") {
+                    let bytes = log.snapshot?.byteCount
+                    workspace.themeButton.performClick(nil)
+                    precondition(window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) !=
+                                 (appearance == "dark" ? NSAppearance.Name.darkAqua : .aqua))
+                    precondition(log.snapshot?.byteCount == bytes, "Changing theme must preserve the displayed session")
                 }
-                let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                    .appendingPathComponent("benchmark-results/UI-preview.png")
-                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try bitmap.representation(using: .png, properties: [:])?.write(to: url)
-                print("Preview: \(url.path)")
+                if CommandLine.arguments.contains("--compact") { window.setContentSize(NSSize(width: 960, height: 600)) }
+                // Preview fixtures are synthetic and never discover or open a real serial port.
+                for hours in [1, 3, 12, 17] {
+                    let history = try SessionWriter(rootDirectory: smokeRoot)
+                    try history.append(Data((sampleLines.joined(separator: "\n") + "\n").utf8))
+                    try history.finish()
+                    var saved = history.snapshot
+                    saved.metadata.startedAt = Date().addingTimeInterval(-Double(hours * 3600))
+                    saved.metadata.endedAt = saved.metadata.startedAt.addingTimeInterval(1122)
+                    try JSONEncoder().encode(saved.metadata).write(to: saved.directory.appendingPathComponent("metadata.json"))
+                    sessions.append(saved)
+                }
+                rebuildSidebar()
+                sidebar.selectRowIndexes(IndexSet(integer: liveRow), byExtendingSelection: false)
+                if state == "paused" { togglePause() }
+                if state == "inspector" { toggleInspector() }
+                if state == "search" {
+                    focusSearch()
+                    searchField.stringValue = "AppleCredentialManager"
+                    log.highlightedQuery = searchField.stringValue
+                    if let reader = log.reader, let snapshot = log.snapshot,
+                       let match = try reader.find(Data(searchField.stringValue.utf8), from: 0, backwards: false, snapshot: snapshot, isCancelled: { false }) {
+                        try log.reveal(match)
+                        searchStatus.stringValue = "Match at byte \(match.lowerBound)"
+                    }
+                }
+                if state == "history" {
+                    sidebar.selectRowIndexes(IndexSet(integer: sidebarItems.count - 1), byExtendingSelection: false)
+                    let deadline = Date().addingTimeInterval(2)
+                    while log.snapshot?.directory != sessions.last?.directory && Date() < deadline {
+                        try await Task.sleep(nanoseconds: 10_000_000)
+                    }
+                    precondition(viewingHistory && log.snapshot?.directory == sessions.last?.directory,
+                                 "Selecting a grouped history row must load that saved session")
+                }
+                if state == "disconnected" {
+                    received(CaptureUpdate(snapshot: writer.snapshot, status: "Interface disconnected", device: nil, isError: false))
+                }
+                if state == "waiting" {
+                    let empty = try SessionWriter(rootDirectory: smokeRoot)
+                    received(CaptureUpdate(snapshot: empty.snapshot, status: "Waiting for interface", device: nil, isError: false))
+                    try empty.finish()
+                }
+                workspace.layoutSubtreeIfNeeded()
+                if state == "settings" {
+                    var second = sampleDevice
+                    second.path = "/dev/cu.usbmodem11201"; second.serialNumber = "99EA21A8E17C8F2A"
+                    picker.update(devices: [sampleDevice, second], selectedID: sampleDevice.stableID,
+                                  activeID: sampleDevice.stableID, error: nil)
+                    // Render the same picker view in the window for a deterministic component preview.
+                    workspace.addSubview(picker)
+                    picker.frame = NSRect(x: workspace.bounds.width - 465, y: 56, width: 340, height: 250)
+                }
+                workspace.layoutSubtreeIfNeeded()
+                if state == "wrapped" {
+                    log.canvas.scrollToRow(0)
+                    if let point = log.canvas.point(for: LogPosition(row: 0, column: 6)) {
+                        log.canvas.beginSelection(at: point, extending: false, clicks: 2)
+                    }
+                }
+                let filename = "UI-\(appearance)-\(state)\(CommandLine.arguments.contains("--toggle-theme") ? "-toggled" : "")\(CommandLine.arguments.contains("--compact") ? "-compact" : "").png"
+                try savePreview(filename)
+                if state == "history" {
+                    jumpLatest()
+                    precondition(!viewingHistory && log.snapshot?.directory == latest?.snapshot.directory,
+                                 "Return to Live must restore the active session")
+                    print("History smoke passed: grouped selection, background load, return to live")
+                }
             }
             NSApp.terminate(nil)
         } catch {
