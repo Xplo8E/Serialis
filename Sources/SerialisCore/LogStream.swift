@@ -26,7 +26,7 @@ public final class LogStream {
         lineOffset = cursor
         // A follower joining halfway through a line waits for the next line;
         // it must not present a suffix as though it were a whole new message.
-        if tail == nil && !newCapture && cursor > 0 {
+        if (tail == nil || tail == 0) && !newCapture && cursor > 0 {
             skippingPrefix = try reader.readBytes(in: cursor - 1..<cursor).first != 0x0A
         }
     }

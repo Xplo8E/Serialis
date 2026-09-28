@@ -54,6 +54,8 @@ private final class CLIRunner {
     var stream: LogStream?
     var latest: SessionSnapshot?
     var signals: [DispatchSourceSignal] = []
+    private let shutdownQueue = DispatchQueue(label: "Serialis.cli.shutdown")
+    private var shutdownRequested = false // Accessed only on shutdownQueue.
     var discoveryTimer: Timer?
     var stopped = false
     var exitCode: Int32 = 0
@@ -103,10 +105,18 @@ private final class CLIRunner {
         capture.onUpdate = { [weak self] update in self?.received(update) }
         for number in [SIGINT, SIGTERM] {
             signal(number, SIG_IGN)
-            // Finalize even if stdout is blocked by a slow pipe consumer. This is
-            // a Dispatch callback, not a POSIX signal handler, so file I/O is safe.
-            let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
-            source.setEventHandler { capture.stop(); exit(0) }
+            let source = DispatchSource.makeSignalSource(signal: number, queue: shutdownQueue)
+            source.setEventHandler { [weak self] in
+                guard let self, !self.shutdownRequested else { return }
+                self.shutdownRequested = true
+                // Save capture independently of stdout, then let the main loop
+                // drain its buffered fragment through the normal shutdown path.
+                capture.stop()
+                DispatchQueue.main.async { self.stopped = true }
+                // A stalled pipe must not trap Ctrl+C forever. Raw capture is
+                // already finalized before this bounded output-drain fallback.
+                self.shutdownQueue.asyncAfter(deadline: .now() + 2) { exit(0) }
+            }
             source.resume()
             signals.append(source)
         }
@@ -122,7 +132,13 @@ private final class CLIRunner {
             // Owner stop flushes metadata and writes its final progress. Followers
             // detach without stopping the owner, but can print their buffered tail.
             let final = try store.lastState()
-            let snapshot = final?.snapshot.metadata.id == latest.metadata.id ? final!.snapshot : latest
+            var snapshot = latest
+            if let final, final.snapshot.metadata.id == latest.metadata.id,
+               final.snapshot.byteCount >= latest.byteCount {
+                snapshot = final.snapshot
+            }
+            // Crash recovery can observe more bytes than the last published
+            // progress record. Never move that final read boundary backwards.
             try stream?.drain(snapshot, final: true, emit: output)
         }
         return exitCode

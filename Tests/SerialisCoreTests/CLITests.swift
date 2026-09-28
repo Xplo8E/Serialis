@@ -61,6 +61,18 @@ final class CLITests: XCTestCase {
         XCTAssertEqual(lines.map(\.message), ["new"])
     }
 
+    func testZeroTailSkipsAnExistingPartialLineButKeepsNewLines() throws {
+        let writer = try SessionWriter(rootDirectory: root())
+        try writer.append(Data("prefix".utf8))
+        let stream = try LogStream(snapshot: writer.snapshot, tail: 0)
+        try writer.append(Data("suffix\nnew\n".utf8))
+        var lines: [StreamLine] = []
+        try stream.drain(writer.snapshot, final: true) { lines.append($0) }
+        XCTAssertEqual(lines.map(\.message), ["new"])
+        XCTAssertEqual(lines.first?.offset, 13)
+        XCTAssertEqual(lines.first?.partial, false)
+    }
+
     func testVeryLongLineIsBoundedAndEmittedAsFragments() throws {
         let writer = try SessionWriter(rootDirectory: root())
         let stream = try LogStream(snapshot: writer.snapshot, tail: nil, newCapture: true)

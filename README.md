@@ -128,6 +128,7 @@ dist/Serialis.app/Contents/MacOS/Serialis --list-devices
 dist/Serialis.app/Contents/MacOS/Serialis --transport-smoke
 dist/Serialis.app/Contents/MacOS/Serialis --cli-smoke
 python3 scripts/test-cli.py dist/Serialis.app/Contents/MacOS/Serialis
+python3 scripts/test-cli-shutdown.py dist/Serialis.app/Contents/MacOS/Serialis
 /usr/bin/time -l dist/Serialis.app/Contents/MacOS/Serialis --benchmark
 dist/Serialis.app/Contents/MacOS/Serialis --ui-smoke
 ```
