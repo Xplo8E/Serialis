@@ -70,7 +70,7 @@ The script builds through Swift Package Manager and creates a local ad-hoc signe
 
 ## Command line
 
-Open **Serialis → Install Command-Line Tool…** and save `serialis` in a directory on your `PATH` (the default is `~/.local/bin`). Keep the app in its final location before installing. If needed, add this to your shell configuration:
+Choose **Serialis → Install Command-Line Tool** to install directly into `~/.local/bin`. A small success popup appears after the launcher passes its version check. Keep the app in its final location before installing. If needed, add this to your shell configuration:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"

@@ -81,7 +81,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         app.submenu = NSMenu(title: "Serialis")
         let about = app.submenu!.addItem(withTitle: "About Serialis", action: #selector(showAbout), keyEquivalent: "")
         about.target = self
-        let installCLI = app.submenu!.addItem(withTitle: "Install Command-Line Tool…", action: #selector(installCommandLineTool), keyEquivalent: "")
+        let installCLI = app.submenu!.addItem(withTitle: "Install Command-Line Tool", action: #selector(installCommandLineTool), keyEquivalent: "")
         installCLI.target = self
         app.submenu?.addItem(.separator())
         app.submenu?.addItem(withTitle: "Quit Serialis", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")

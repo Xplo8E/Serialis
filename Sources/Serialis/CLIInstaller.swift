@@ -1,4 +1,5 @@
 import AppKit
+import SerialisCore
 
 /// The launcher uses the app's executable, so CLI and GUI always share a version.
 enum CLIInstaller {
@@ -6,24 +7,24 @@ enum CLIInstaller {
         do {
             guard let executable = Bundle.main.executableURL else { throw CocoaError(.fileNoSuchFile) }
             let directory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let panel = NSSavePanel()
-            panel.title = "Install Serialis Command-Line Tool"
-            panel.message = "Choose a folder on your PATH. Keep Serialis.app at its current location after installing."
-            panel.nameFieldStringValue = "serialis"
-            panel.directoryURL = directory
-            panel.canCreateDirectories = true
-            guard panel.runModal() == .OK, let destination = panel.url else { return }
-            guard destination.standardizedFileURL != executable.standardizedFileURL else {
-                throw CocoaError(.fileWriteInvalidFileName)
+            let destination = try CLIInstallation.install(executable: executable, directory: directory)
+            // Verify the installed launcher itself before reporting success.
+            let process = Process()
+            process.executableURL = destination
+            process.arguments = ["--version"]
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0,
+                  String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) == "Serialis \(AppVersion.string)" else {
+                throw CLIError("The command-line tool was written, but its version check failed.")
             }
-            let quoted = "'" + executable.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
-            let launcher = "#!/bin/sh\nexec \(quoted) --cli \"$@\"\n"
-            try launcher.write(to: destination, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
             let alert = NSAlert()
-            alert.messageText = "Command-Line Tool Installed"
-            alert.informativeText = "Run serialis --help in Terminal. If the command is not found, add \(destination.deletingLastPathComponent().path) to your shell’s PATH."
+            alert.messageText = "CLI installed successfully"
+            alert.informativeText = "Installed to ~/.local/bin/serialis.\nRun serialis --help in Terminal."
             alert.runModal()
         } catch { NSAlert(error: error).runModal() }
     }
