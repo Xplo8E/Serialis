@@ -1,13 +1,13 @@
 import Darwin
 import Foundation
 
-/// Prevent a second process from recovering indexes that the first process is still writing.
+/// Keep one GUI window process; serial ownership is coordinated separately.
 final class AppInstanceLock {
     private let descriptor: Int32
 
     init(directory: URL) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        descriptor = open(directory.appendingPathComponent(".capture.lock").path, O_CREAT | O_RDWR, 0o600)
+        descriptor = open(directory.appendingPathComponent(".gui.lock").path, O_CREAT | O_RDWR, 0o600)
         guard descriptor >= 0 else { throw CocoaError(.fileWriteNoPermission) }
         guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             close(descriptor)

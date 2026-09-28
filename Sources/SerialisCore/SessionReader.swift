@@ -93,12 +93,12 @@ public final class SessionReader {
             throw SessionStoreError.corruptIndex(indexURL)
         }
 
-        return LogRow(receivedAt: try receivedAt(offset: start), offset: start, data: try readRawBytes(in: start..<end))
+        return LogRow(receivedAt: try timestamp(at: start), offset: start, data: try readRawBytes(in: start..<end))
     }
 
     /// Resolve only the chunk containing the row's first byte. Binary search
     /// uses constant memory, including while another process appends to the file.
-    private func receivedAt(offset: UInt64) throws -> Date? {
+    public func timestamp(at offset: UInt64) throws -> Date? {
         guard timestampsFD >= 0 else { return nil }
         var info = stat()
         guard fstat(timestampsFD, &info) == 0 else { return nil }

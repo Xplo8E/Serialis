@@ -62,7 +62,7 @@ public struct SessionMetadata: Codable, Sendable {
     public var events: [SessionEvent]
 }
 
-public struct SessionSnapshot: Sendable {
+public struct SessionSnapshot: Codable, Sendable {
     public var directory: URL
     public var metadata: SessionMetadata
     public var byteCount: UInt64

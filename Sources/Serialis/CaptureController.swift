@@ -7,13 +7,25 @@ struct CaptureUpdate {
     let status: String
     let device: SerialDevice?
     let isError: Bool
+    var selectedDeviceID: String? = nil
+    var ownerEnded = false
+    var disconnectionCount: UInt64 = 0
 }
 
 /// All port and file operations live on one queue, separate from AppKit's main thread.
 final class CaptureController {
     var onUpdate: ((CaptureUpdate) -> Void)?
     private let queue = DispatchQueue(label: "Serialis.capture", qos: .userInitiated)
-    private let writer: SessionWriter
+    private var writer: SessionWriter?
+    private let store: ActiveCaptureStore
+    private var lease: CaptureLease?
+    let isFollower: Bool
+    private var followed: ActiveCapture?
+    private var hasFollowerUpdate = false
+    private var disconnectionCount: UInt64 = 0
+    private var selectedDeviceID: String?
+    private var stopped = false
+    private let portClosures = DispatchGroup()
     private var source: DispatchSourceRead?
     private var timer: DispatchSourceTimer?
     private var fd: Int32 = -1
@@ -28,7 +40,33 @@ final class CaptureController {
     private var pendingUpdate: CaptureUpdate?
     private var deliveryScheduled = false
 
-    init(rootDirectory: URL) throws { writer = try SessionWriter(rootDirectory: rootDirectory) }
+    init(rootDirectory: URL, selectedDeviceID: String? = nil) throws {
+        self.selectedDeviceID = selectedDeviceID
+        store = ActiveCaptureStore(rootDirectory: rootDirectory)
+        // A new owner publishes its session immediately after taking the lock.
+        // Briefly retry startup rather than following a stale or missing record.
+        let deadline = Date().addingTimeInterval(5)
+        while true {
+            lease = try store.acquire()
+            if lease != nil { break }
+            if let active = try store.active() {
+                followed = active
+                break
+            }
+            guard Date() < deadline else {
+                throw CLIError("Another Serialis process holds capture but has no active session. Close older Serialis versions and try again.")
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        isFollower = lease == nil
+        if let lease {
+            let writer = try SessionWriter(rootDirectory: rootDirectory)
+            self.writer = writer
+            let state = ActiveCapture(token: lease.token, snapshot: writer.snapshot, status: status,
+                                      device: nil, isError: false, disconnectionCount: 0, selectedDeviceID: selectedDeviceID)
+            try store.publish(state, lease: lease)
+        }
+    }
 
     func start() {
         queue.async { [self] in
@@ -43,8 +81,9 @@ final class CaptureController {
 
     func connect(_ chosen: SerialDevice) {
         queue.async { [self] in
-            guard !self.storageFailed else { return }
+            guard !self.storageFailed, !self.stopped, let writer = self.writer else { return }
             if self.device == chosen, self.fd >= 0 { return }
+            self.selectedDeviceID = chosen.stableID
             self.closePort(reason: "Interface changed")
             do {
                 self.status = "Connecting to \(chosen.displayName)"
@@ -65,7 +104,7 @@ final class CaptureController {
                     cfsetospeed(&settings, speed_t(B115200))
                     guard tcsetattr(descriptor, TCSANOW, &settings) == 0 else { throw Self.posixError("Set 115200 baud") }
                     // Do not flush the input queue: bytes already waiting are part of the capture.
-                    try self.writer.beginSegment(device: chosen)
+                    try writer.beginSegment(device: chosen)
                 } catch {
                     close(descriptor)
                     throw error
@@ -75,7 +114,9 @@ final class CaptureController {
                 let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: self.queue)
                 source.setEventHandler { [weak self] in self?.readAvailableBytes() }
                 // Dispatch must finish with the old source before its descriptor can be reused.
-                source.setCancelHandler { close(descriptor) }
+                let closures = self.portClosures
+                closures.enter()
+                source.setCancelHandler { close(descriptor); closures.leave() }
                 self.source = source
                 source.resume()
                 self.status = "Capturing"
@@ -86,6 +127,7 @@ final class CaptureController {
 
     func disconnected() {
         queue.async {
+            guard !self.isFollower, !self.stopped else { return }
             self.closePort(reason: "Device disconnected")
             self.status = "Disconnected · waiting for selected interface"
             self.publish()
@@ -93,7 +135,7 @@ final class CaptureController {
     }
 
     private func readAvailableBytes() {
-        guard fd >= 0 else { return }
+        guard fd >= 0, let writer else { return }
         var buffer = [UInt8](repeating: 0, count: 65536)
         for _ in 0..<4 {
             let count = read(fd, &buffer, buffer.count)
@@ -109,11 +151,19 @@ final class CaptureController {
                 publish()
                 return
             } else if errno == EAGAIN || errno == EWOULDBLOCK { return }
-            else if errno != EINTR { fail(Self.posixError("Read serial data")); return }
+            else if [EIO, ENXIO, ENODEV].contains(errno) {
+                closePort(reason: "Device disconnected")
+                status = "Disconnected · waiting for selected interface"
+                publish()
+                return
+            } else if errno != EINTR { fail(Self.posixError("Read serial data")); return }
         }
     }
 
     private func tick() {
+        guard !stopped else { return }
+        if isFollower { pollOwner(); return }
+        guard let writer else { return }
         if needsCheckpoint && !storageFailed && Date().timeIntervalSince(lastCheckpoint) >= 1 {
             do { try writer.checkpoint() }
             catch { fail(error, storageFailure: true) }
@@ -127,8 +177,9 @@ final class CaptureController {
         source?.cancel()
         source = nil
         if fd >= 0 {
+            disconnectionCount += 1
             fd = -1
-            do { try writer.endSegment(reason: reason) }
+            do { try writer?.endSegment(reason: reason) }
             catch { status = "Could not finalize capture: \(error.localizedDescription)"; isError = true }
         }
         device = nil
@@ -143,7 +194,54 @@ final class CaptureController {
     }
 
     private func publish() {
-        let update = CaptureUpdate(snapshot: writer.snapshot, status: status, device: device, isError: isError)
+        guard let writer, let lease else { return }
+        let state = ActiveCapture(token: lease.token, snapshot: writer.snapshot, status: status,
+                                  device: device, isError: isError, disconnectionCount: disconnectionCount, selectedDeviceID: selectedDeviceID)
+        do { try store.publish(state, lease: lease) }
+        catch {
+            status = "Cannot publish capture progress: \(error.localizedDescription)"
+            isError = true
+        }
+        deliver(CaptureUpdate(snapshot: writer.snapshot, status: status, device: device,
+                              isError: isError, selectedDeviceID: selectedDeviceID, disconnectionCount: disconnectionCount))
+    }
+
+    private func pollOwner() {
+        guard let previous = followed else { return }
+        do {
+            if let state = try store.active(), state.token == previous.token {
+                let changed = !hasFollowerUpdate || state.snapshot.byteCount != previous.snapshot.byteCount ||
+                    state.status != previous.status || state.device != previous.device ||
+                    state.isError != previous.isError || state.disconnectionCount != previous.disconnectionCount
+                followed = state
+                if changed {
+                    hasFollowerUpdate = true
+                    deliver(CaptureUpdate(snapshot: state.snapshot, status: state.status, device: state.device,
+                        isError: state.isError, selectedDeviceID: state.selectedDeviceID,
+                        disconnectionCount: state.disconnectionCount))
+                }
+            } else {
+                // A new owner may already have replaced .active.json. The old
+                // session has its own files and is no longer being written.
+                var final = previous.snapshot
+                if let snapshot = try? SessionReader.loadSnapshot(directory: final.directory, validateIndex: false) {
+                    final = snapshot
+                }
+                stopped = true
+                timer?.cancel(); timer = nil
+                deliver(CaptureUpdate(snapshot: final, status: "Capture owner stopped", device: nil,
+                    isError: previous.isError, selectedDeviceID: previous.selectedDeviceID,
+                    ownerEnded: true, disconnectionCount: previous.disconnectionCount))
+            }
+        } catch {
+            stopped = true
+            timer?.cancel(); timer = nil
+            deliver(CaptureUpdate(snapshot: previous.snapshot, status: error.localizedDescription,
+                                  device: nil, isError: true, ownerEnded: true))
+        }
+    }
+
+    private func deliver(_ update: CaptureUpdate) {
         // Keep just the newest snapshot if a modal dialog or slow drawing blocks AppKit.
         updateLock.lock()
         pendingUpdate = update
@@ -164,12 +262,22 @@ final class CaptureController {
 
     func stop() {
         queue.sync {
-            timer?.cancel()
-            timer = nil
-            closePort(reason: "App closed")
-            do { try writer.finish() }
-            catch { NSLog("Serialis could not finalize its session: %@", error.localizedDescription) }
+            stopped = true
+            timer?.cancel(); timer = nil
+            guard let writer, let lease else { return }
+            closePort(reason: "Capture owner closed")
+            do {
+                try writer.finish()
+                try store.publish(ActiveCapture(token: lease.token, snapshot: writer.snapshot,
+                    status: "Capture ended", device: nil, isError: isError,
+                    disconnectionCount: disconnectionCount, ended: true, selectedDeviceID: selectedDeviceID), lease: lease)
+            } catch { NSLog("Serialis could not finalize its session: %@", error.localizedDescription) }
+            self.writer = nil
         }
+        // Cancellation closes descriptors asynchronously on the capture queue.
+        // Keep ownership until every previous port has actually been closed.
+        portClosures.wait()
+        queue.sync { lease = nil }
     }
 
     private static func posixError(_ operation: String) -> NSError {
