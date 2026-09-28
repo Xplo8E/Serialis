@@ -2,6 +2,39 @@ import XCTest
 @testable import SerialisCore
 
 final class SessionStoreTests: XCTestCase {
+    func testDatedDirectoriesAvoidCollisionsAndKeepIndependentCaptures() throws {
+        let root = try temporaryRoot()
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = try SessionWriter(rootDirectory: root, startedAt: start)
+        try first.append(Data("original\n".utf8))
+        let second = try SessionWriter(rootDirectory: root, startedAt: start)
+        let third = try SessionWriter(rootDirectory: root, startedAt: start)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let name = formatter.string(from: start)
+        XCTAssertEqual(first.snapshot.directory.lastPathComponent, name)
+        XCTAssertEqual(second.snapshot.directory.lastPathComponent, name + "-2")
+        XCTAssertEqual(third.snapshot.directory.lastPathComponent, name + "-3")
+        XCTAssertNotNil(UUID(uuidString: first.snapshot.metadata.id))
+        XCTAssertNotEqual(first.snapshot.metadata.id, second.snapshot.metadata.id)
+        XCTAssertEqual(first.snapshot.metadata.startedAt, start)
+        try first.finish()
+        try second.finish()
+        try third.finish()
+        let reader = try SessionReader(directory: first.snapshot.directory)
+        XCTAssertEqual(try reader.readRow(0, snapshot: first.snapshot).data, Data("original\n".utf8))
+
+        // Legacy UUID folder names and new names can coexist in the catalog.
+        let legacy = root.appendingPathComponent(first.snapshot.metadata.id)
+        try FileManager.default.moveItem(at: first.snapshot.directory, to: legacy)
+        let sessions = try SessionCatalog.list(rootDirectory: root)
+        XCTAssertEqual(sessions.count, 3)
+        XCTAssertTrue(sessions.contains { $0.directory.lastPathComponent == legacy.lastPathComponent && $0.metadata.id == first.snapshot.metadata.id }, "Loaded: \(sessions.map { $0.directory.path }); expected: \(legacy.path)")
+    }
+
     func testReceiveTimesSurviveReopenAndSplitLines() throws {
         let writer = try SessionWriter(rootDirectory: temporaryRoot())
         let first = Date(timeIntervalSince1970: 1_800_000_000.125)

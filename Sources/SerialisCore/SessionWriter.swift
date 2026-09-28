@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public final class SessionWriter {
     private let directory: URL
@@ -19,17 +20,16 @@ public final class SessionWriter {
     private var pendingIndexBytes = Data()
     private var isFinished = false
 
-    public init(rootDirectory: URL) throws {
+    public init(rootDirectory: URL, startedAt: Date = Date()) throws {
         let manager = FileManager.default
         try manager.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
 
         let id = UUID().uuidString
-        directory = rootDirectory.appendingPathComponent(id, isDirectory: true)
+        directory = try Self.createSessionDirectory(in: rootDirectory, startedAt: startedAt)
         rawURL = SessionFiles.rawURL(in: directory)
         indexURL = SessionFiles.indexURL(in: directory)
         metadataURL = SessionFiles.metadataURL(in: directory)
 
-        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
         manager.createFile(atPath: rawURL.path, contents: nil)
         manager.createFile(atPath: indexURL.path, contents: nil)
 
@@ -42,13 +42,35 @@ public final class SessionWriter {
 
         metadata = SessionMetadata(
             id: id,
-            startedAt: Date(),
+            startedAt: startedAt,
             endedAt: nil,
             totalBytes: 0,
             segments: [],
             events: []
         )
         try flushMetadata()
+    }
+
+    private static func createSessionDirectory(in root: URL, startedAt: Date) throws -> URL {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let name = formatter.string(from: startedAt)
+        var suffix = 1
+        while true {
+            let candidate = root.appendingPathComponent(suffix == 1 ? name : "\(name)-\(suffix)", isDirectory: true)
+            // Reserve the directory atomically so simultaneous launches cannot
+            // open and truncate another session's capture files.
+            if mkdir(candidate.path, 0o755) == 0 { return candidate }
+            let errorCode = errno
+            guard errorCode == EEXIST else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errorCode),
+                              userInfo: [NSFilePathErrorKey: candidate.path])
+            }
+            suffix += 1
+        }
     }
 
     deinit {

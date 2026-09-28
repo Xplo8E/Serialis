@@ -70,7 +70,7 @@ The script builds through Swift Package Manager and creates a local ad-hoc signe
 
 ## Files and memory
 
-Sessions live under `~/Library/Application Support/Serialis/Sessions/`. Each app run creates a directory containing:
+Sessions live under `~/Library/Application Support/Serialis/Sessions/`. Each app run creates a directory named with the Mac’s local start time, such as `2026-09-28_11-05-17`. Sessions started in the same second get suffixes (`-2`, `-3`, etc.). The UUID stays in `metadata.json`; existing UUID-named folders remain supported. Each directory contains:
 
 | File | Purpose |
 | --- | --- |
