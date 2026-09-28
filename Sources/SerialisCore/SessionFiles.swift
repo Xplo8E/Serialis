@@ -3,6 +3,7 @@ import Darwin
 
 enum SessionFiles {
     static let rawFileName = "capture.raw"
+    static let timestampsFileName = "timestamps.idx"
     static let indexFileName = "rows.idx"
     static let metadataFileName = "metadata.json"
     static let maxDisplayRowBytes = 16 * 1024

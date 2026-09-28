@@ -75,8 +75,11 @@ Sessions live under `~/Library/Application Support/Serialis/Sessions/`. Each app
 | File | Purpose |
 | --- | --- |
 | `capture.raw` | Exact incoming bytes, including non-text data |
+| `timestamps.idx` | Mac receive times mapped to captured byte ranges |
 | `rows.idx` | Little-endian 64-bit byte offsets for display rows |
 | `metadata.json` | Session times, device segments, and events |
+
+Log dates and times use the Mac’s local timezone, with millisecond precision. Each row shows when its first byte was received; rows received together share a timestamp. These are host receive times, not device event times. Older sessions without timestamps show a dash. Raw capture and selection exports remain unchanged.
 
 The viewer reads visible rows on demand. Search and export read small chunks. The capture queue coalesces UI updates so a blocked window does not accumulate snapshots.
 

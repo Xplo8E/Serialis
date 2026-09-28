@@ -13,7 +13,14 @@ struct LogPosition: Comparable {
 /// an estimated height, so resizing never scans or loads the entire capture.
 final class WrappedLogView: NSView {
     static let lineHeight: CGFloat = 24
-    static let textInset: CGFloat = 78
+    static let textInset: CGFloat = 268
+    private let timestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return formatter
+    }()
     var onPositionChange: (() -> Void)?
     var onCopy: (() -> Void)?
     var onError: ((Error) -> Void)?
@@ -171,6 +178,7 @@ final class WrappedLogView: NSView {
         func load(_ index: UInt64) throws -> WrappedLogRow {
             let raw = try reader.readRow(index, snapshot: snapshot)
             let row = reusable.popLast() ?? WrappedLogRow()
+            row.timestamp = raw.receivedAt.map { timestampFormatter.string(from: $0) } ?? "—"
             row.update(index: index, data: raw.data, width: width, query: query)
             return row
         }
@@ -225,11 +233,13 @@ final class WrappedLogView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         ConsoleTheme.background.setFill(); dirtyRect.fill()
-        ConsoleTheme.gutter.setFill(); dirtyRect.intersection(NSRect(x: 0, y: dirtyRect.minY, width: 62, height: dirtyRect.height)).fill()
-        ConsoleTheme.border.setFill(); NSRect(x: 61, y: dirtyRect.minY, width: 1, height: dirtyRect.height).fill()
+        ConsoleTheme.gutter.setFill(); dirtyRect.intersection(NSRect(x: 0, y: dirtyRect.minY, width: Self.textInset - 16, height: dirtyRect.height)).fill()
+        ConsoleTheme.border.setFill(); NSRect(x: Self.textInset - 17, y: dirtyRect.minY, width: 1, height: dirtyRect.height).fill()
         let numberStyle = NSMutableParagraphStyle()
         numberStyle.minimumLineHeight = 24; numberStyle.maximumLineHeight = 24
         numberStyle.alignment = .right
+        let timestampStyle = numberStyle.mutableCopy() as! NSMutableParagraphStyle
+        timestampStyle.alignment = .left
         for row in rows where row.y < dirtyRect.maxY && row.y + row.height > dirtyRect.minY {
             let origin = NSPoint(x: Self.textInset, y: row.y)
             row.draw(at: origin, selection: selection)
@@ -238,6 +248,9 @@ final class WrappedLogView: NSView {
             let attributes: [NSAttributedString.Key: Any] = [.font: numberFont,
                 .foregroundColor: ConsoleTheme.tertiary, .paragraphStyle: numberStyle]
             number.draw(in: NSRect(x: 0, y: row.y, width: 54, height: 24), withAttributes: attributes)
+            (row.timestamp as NSString).draw(in: NSRect(x: 66, y: row.y, width: 182, height: 24),
+                withAttributes: [.font: WrappedLogRow.font, .paragraphStyle: timestampStyle,
+                                 .foregroundColor: ConsoleTheme.tertiary])
             if selection == nil, caret?.row == row.index, let caret, window?.firstResponder === self {
                 ConsoleTheme.text.setFill(); row.caretRect(caret.column).offsetBy(dx: origin.x, dy: origin.y).fill()
             }
@@ -390,6 +403,7 @@ private final class WrappedLogRow {
     let container = NSTextContainer(containerSize: NSSize(width: 1, height: CGFloat.greatestFiniteMagnitude))
     private(set) var height: CGFloat = 24
     var y: CGFloat = 0
+    var timestamp = ""
 
     init() {
         container.lineFragmentPadding = 0

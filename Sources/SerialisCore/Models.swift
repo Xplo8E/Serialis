@@ -70,6 +70,7 @@ public struct SessionSnapshot: Sendable {
 }
 
 public struct LogRow: Sendable, Equatable {
+    public var receivedAt: Date? = nil
     public var offset: UInt64
     public var data: Data
 }

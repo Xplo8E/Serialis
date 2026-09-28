@@ -2,6 +2,42 @@ import XCTest
 @testable import SerialisCore
 
 final class SessionStoreTests: XCTestCase {
+    func testReceiveTimesSurviveReopenAndSplitLines() throws {
+        let writer = try SessionWriter(rootDirectory: temporaryRoot())
+        let first = Date(timeIntervalSince1970: 1_800_000_000.125)
+        // A clock adjustment must not affect lookup: records are ordered by byte offset.
+        let second = first.addingTimeInterval(-10)
+        try writer.append(Data("partial".utf8), receivedAt: first)
+        try writer.append(Data(" line\nsecond\nthird".utf8), receivedAt: second)
+        try writer.finish()
+        let snapshot = try SessionReader.loadSnapshot(directory: writer.snapshot.directory)
+        let reader = try SessionReader(directory: snapshot.directory)
+        XCTAssertEqual(try reader.readRow(0, snapshot: snapshot).receivedAt, first)
+        XCTAssertEqual(try reader.readRow(1, snapshot: snapshot).receivedAt, second)
+        XCTAssertEqual(try reader.readRow(2, snapshot: snapshot).receivedAt, second)
+        XCTAssertEqual(try reader.readBytes(in: 0..<snapshot.byteCount), Data("partial line\nsecond\nthird".utf8))
+    }
+
+    func testMissingAndTruncatedTimestampsDoNotInventTimes() throws {
+        let writer = try SessionWriter(rootDirectory: temporaryRoot())
+        try writer.append(Data("first\n".utf8))
+        try writer.append(Data("second\n".utf8))
+        try writer.finish()
+        let directory = writer.snapshot.directory
+        let timingURL = directory.appendingPathComponent(SessionFiles.timestampsFileName)
+        let handle = try FileHandle(forWritingTo: timingURL)
+        try handle.truncate(atOffset: 30) // One full record and part of the next.
+        try handle.close()
+        let snapshot = try SessionReader.loadSnapshot(directory: directory)
+        let reader = try SessionReader(directory: directory)
+        XCTAssertNotNil(try reader.readRow(0, snapshot: snapshot).receivedAt)
+        XCTAssertNil(try reader.readRow(1, snapshot: snapshot).receivedAt)
+        try FileManager.default.removeItem(at: timingURL)
+        let legacyReader = try SessionReader(directory: directory)
+        XCTAssertNil(try legacyReader.readRow(0, snapshot: snapshot).receivedAt)
+        XCTAssertEqual(try legacyReader.readRow(1, snapshot: snapshot).data, Data("second\n".utf8))
+    }
+
     func testPreservesRawBinaryBytesAndRows() throws {
         let writer = try SessionWriter(rootDirectory: temporaryRoot())
         let bytes = Data([0x00, 0x41, 0xFF, 0x0A, 0x42])

@@ -7,6 +7,7 @@ public final class SessionWriter {
     private let metadataURL: URL
     private let rawHandle: FileHandle
     private let indexHandle: FileHandle
+    private let timestampsHandle: FileHandle
     private let encoder = JSONEncoder()
 
     private var metadata: SessionMetadata
@@ -35,6 +36,10 @@ public final class SessionWriter {
         rawHandle = try FileHandle(forWritingTo: rawURL)
         indexHandle = try FileHandle(forWritingTo: indexURL)
 
+        let timestampsURL = directory.appendingPathComponent(SessionFiles.timestampsFileName)
+        manager.createFile(atPath: timestampsURL.path, contents: nil)
+        timestampsHandle = try FileHandle(forWritingTo: timestampsURL)
+
         metadata = SessionMetadata(
             id: id,
             startedAt: Date(),
@@ -49,6 +54,7 @@ public final class SessionWriter {
     deinit {
         try? rawHandle.close()
         try? indexHandle.close()
+        try? timestampsHandle.close()
     }
 
     public var snapshot: SessionSnapshot {
@@ -85,7 +91,7 @@ public final class SessionWriter {
         try flushMetadata()
     }
 
-    public func append(_ data: Data) throws {
+    public func append(_ data: Data, receivedAt: Date = Date()) throws {
         guard !isFinished else {
             throw SessionStoreError.sessionFinished
         }
@@ -93,6 +99,16 @@ public final class SessionWriter {
 
         try rawHandle.seekToEnd()
         try rawHandle.write(contentsOf: data)
+
+        // Each 24-byte record stores a chunk's offset, length, and Mac receive
+        // time (Double seconds since 1970), all little-endian. Explicit lengths
+        // keep a missing/truncated record from assigning a false time to later bytes.
+        var timing = Data()
+        for value in [byteCount, UInt64(data.count), receivedAt.timeIntervalSince1970.bitPattern] {
+            var encoded = value.littleEndian
+            withUnsafeBytes(of: &encoded) { timing.append(contentsOf: $0) }
+        }
+        try timestampsHandle.write(contentsOf: timing)
 
         // The raw file is append-only. The index stores only display-row starts,
         // so memory use stays constant even when the capture grows for hours.
@@ -129,6 +145,7 @@ public final class SessionWriter {
         try flushIndexBuffer()
         try rawHandle.synchronize()
         try indexHandle.synchronize()
+        try timestampsHandle.synchronize()
         try flushMetadata()
         bytesSinceSync = 0
     }

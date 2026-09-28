@@ -7,6 +7,7 @@ public final class SessionReader {
     private let indexURL: URL
     private let rawFD: Int32
     private let indexFD: Int32
+    private let timestampsFD: Int32
 
     public init(directory: URL) throws {
         self.directory = directory
@@ -18,9 +19,12 @@ public final class SessionReader {
             throw SessionStoreError.invalidSessionDirectory(directory)
         }
 
+        // Older sessions have no timing sidecar and remain readable.
+        timestampsFD = open(directory.appendingPathComponent(SessionFiles.timestampsFileName).path, O_RDONLY)
         indexFD = open(indexURL.path, O_RDONLY)
         guard indexFD >= 0 else {
             close(rawFD)
+            if timestampsFD >= 0 { close(timestampsFD) }
             throw SessionStoreError.invalidSessionDirectory(directory)
         }
     }
@@ -28,6 +32,7 @@ public final class SessionReader {
     deinit {
         close(rawFD)
         close(indexFD)
+        if timestampsFD >= 0 { close(timestampsFD) }
     }
 
     public static func loadSnapshot(directory: URL, validateIndex: Bool = true) throws -> SessionSnapshot {
@@ -88,7 +93,33 @@ public final class SessionReader {
             throw SessionStoreError.corruptIndex(indexURL)
         }
 
-        return LogRow(offset: start, data: try readRawBytes(in: start..<end))
+        return LogRow(receivedAt: try receivedAt(offset: start), offset: start, data: try readRawBytes(in: start..<end))
+    }
+
+    /// Resolve only the chunk containing the row's first byte. Binary search
+    /// uses constant memory, including while another process appends to the file.
+    private func receivedAt(offset: UInt64) throws -> Date? {
+        guard timestampsFD >= 0 else { return nil }
+        var info = stat()
+        guard fstat(timestampsFD, &info) == 0 else { return nil }
+        var low: UInt64 = 0
+        var high = UInt64(max(0, info.st_size)) / 24 // Ignore an incomplete final record.
+        while low < high {
+            let middle = low + (high - low) / 2
+            let record = try read(fd: timestampsFD, offset: middle * 24, count: 24, source: "timestamps.idx")
+            let values = record.withUnsafeBytes { bytes in
+                (0..<3).map { UInt64(littleEndian: bytes.loadUnaligned(fromByteOffset: $0 * 8, as: UInt64.self)) }
+            }
+            if offset < values[0] {
+                high = middle
+            } else if offset - values[0] >= values[1] {
+                low = middle + 1
+            } else {
+                let seconds = Double(bitPattern: values[2])
+                return seconds.isFinite ? Date(timeIntervalSince1970: seconds) : nil
+            }
+        }
+        return nil
     }
 
     public func readBytes(in range: Range<UInt64>) throws -> Data {
