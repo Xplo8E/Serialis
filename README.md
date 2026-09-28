@@ -68,6 +68,37 @@ The script builds through Swift Package Manager and creates a local ad-hoc signe
 - Reconnecting the selected board resumes the current session. Switching interfaces records a new segment with its byte offsets.
 - If another program such as `tio` owns the port, close that connection and choose **Retry**. Serialis does not terminate the other program.
 
+## Command line
+
+Open **Serialis → Install Command-Line Tool…** and save `serialis` in a directory on your `PATH` (the default is `~/.local/bin`). Keep the app in its final location before installing. If needed, add this to your shell configuration:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+```sh
+serialis                              # Stream live logs and save the full capture
+serialis --devices                    # List supported interfaces and stable IDs
+serialis --device ID                  # Choose an interface when starting capture
+serialis --tail 100 --no-follow        # Read a snapshot of the active capture
+serialis --tail 100 --json             # Recent logs, then live JSON records
+serialis -m AppleSEP -m panic          # Include either literal term
+serialis -m AppleSEP -m error --match-all
+serialis -m AppleSEP -M heartbeat -i   # Case-insensitive inclusion and exclusion
+serialis --version                    # Same bundle version as the GUI
+serialis --help
+```
+
+The first GUI or CLI process owns capture. Later processes follow its active session without opening the serial port. The GUI disables interface selection while following another process. Pausing the GUI display or browsing history does not interrupt CLI output.
+
+Without `--tail`, streaming starts with new lines. `--no-follow` prints the latest 100 source lines and exits, or the count supplied with `--tail`. Snapshot mode requires an active capture. Filters apply after selecting those source lines and never change saved data. Repeat `--match` for OR, add `--match-all` for AND, and repeat `--unmatch` to exclude any term. Matching is literal and case-sensitive unless `-i` is supplied.
+
+Ctrl+C stops your capture if you own it; otherwise it only detaches your CLI. Followers exit when the capture owner stops, and never take ownership automatically. Owners wait for reconnection by default; `-x` / `--exit-on-disconnect` exits on disconnect. With multiple interfaces connected, the CLI requires `--device ID` when starting a capture. An explicit device conflicting with an active capture is rejected.
+
+Logs go to stdout and connection messages to stderr. `--no-timestamps` hides dates in text output. `--json` emits session ID, byte offset, timestamp (UTC ISO 8601 or `null`), message, and a `partial` flag. Incomplete lines are buffered until completion or shutdown; lines larger than 1 MiB are emitted as partial fragments to bound memory. Filters apply separately to these fragments. Text output escapes terminal control characters, and decoded text may replace invalid UTF-8; `capture.raw` remains byte-exact.
+
+For a source build, use `xcrun swift run Serialis --cli --help`. Unbundled development builds report `development`; packaged GUI and CLI read the same app version. `SERIALIS_SESSIONS_DIR` overrides the sessions directory for both interfaces, including isolated tests.
+
 ## Files and memory
 
 Sessions live under `~/Library/Application Support/Serialis/Sessions/`. Each app run creates a directory named with the Mac’s local start time, such as `2026-09-28_11-05-17`. Sessions started in the same second get suffixes (`-2`, `-3`, etc.). The UUID stays in `metadata.json`; existing UUID-named folders remain supported. Each directory contains:
@@ -95,6 +126,8 @@ There is no automatic deletion or retention limit. Use **Open Sessions Folder** 
 xcrun swift test
 dist/Serialis.app/Contents/MacOS/Serialis --list-devices
 dist/Serialis.app/Contents/MacOS/Serialis --transport-smoke
+dist/Serialis.app/Contents/MacOS/Serialis --cli-smoke
+python3 scripts/test-cli.py dist/Serialis.app/Contents/MacOS/Serialis
 /usr/bin/time -l dist/Serialis.app/Contents/MacOS/Serialis --benchmark
 dist/Serialis.app/Contents/MacOS/Serialis --ui-smoke
 ```

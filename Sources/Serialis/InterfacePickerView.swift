@@ -17,6 +17,7 @@ final class InterfacePickerView: NSView {
     private let footerLeft = NSTextField(labelWithString: "115200 baud · 8N1")
     private let footerRight = NSTextField(labelWithString: "0 supported")
 
+    private var readOnly = false
     private var devices: [SerialDevice] = []
     private var selectedID: String?
     private var activeID: String?
@@ -46,7 +47,11 @@ final class InterfacePickerView: NSView {
         NSSize(width: 340, height: 250)
     }
 
-    func update(devices: [SerialDevice], selectedID: String?, activeID: String?, error: String?) {
+    func update(devices: [SerialDevice], selectedID: String?, activeID: String?, error: String?, readOnly: Bool = false) {
+        self.readOnly = readOnly
+        headerLabel.stringValue = readOnly ? "External capture · read only" : "Serial interface"
+        headerLabel.toolTip = readOnly ? "The capture owner controls device selection." : nil
+        retryButton.isEnabled = !readOnly
         self.devices = devices
         self.selectedID = selectedID
         self.activeID = activeID
@@ -137,6 +142,7 @@ final class InterfacePickerView: NSView {
         rowViews = devices.map { device in
             let row = InterfaceRowView()
             row.device = device
+            row.isEnabled = !readOnly
             row.isSelectedDevice = device.stableID == selectedID
             row.isActiveDevice = device.stableID == activeID
             row.onClick = { [weak self, device] in self?.onSelect?(device) }

@@ -41,8 +41,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     private let historyQueue = DispatchQueue(label: "Serialis.history", qos: .userInitiated)
     private var root: URL {
         if smokeTest { return smokeRoot }
-        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Serialis/Sessions", isDirectory: true)
+        return SessionLocation.root
     }
     private var selectedID: String? {
         get { UserDefaults.standard.string(forKey: "selectedInterface") }
@@ -53,7 +52,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         do {
             instanceLock = try AppInstanceLock(directory: root)
             sessions = try SessionCatalog.list(rootDirectory: root)
-            capture = try CaptureController(rootDirectory: root)
+            capture = try CaptureController(rootDirectory: root, selectedDeviceID: smokeTest ? nil : selectedID)
             buildMenu()
             buildWindow()
             capture.onUpdate = { [weak self] update in self?.received(update) }
@@ -82,6 +81,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         app.submenu = NSMenu(title: "Serialis")
         let about = app.submenu!.addItem(withTitle: "About Serialis", action: #selector(showAbout), keyEquivalent: "")
         about.target = self
+        let installCLI = app.submenu!.addItem(withTitle: "Install Command-Line Tool…", action: #selector(installCommandLineTool), keyEquivalent: "")
+        installCLI.target = self
         app.submenu?.addItem(.separator())
         app.submenu?.addItem(withTitle: "Quit Serialis", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(app)
@@ -105,6 +106,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         menu.addItem(find)
         NSApp.mainMenu = menu
     }
+
+    @objc private func installCommandLineTool() { CLIInstaller.install() }
 
     @objc private func showAbout() {
         let paragraph = NSMutableParagraphStyle()
@@ -190,7 +193,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
 
     private func buildSettings() {
         picker.onSelect = { [weak self] device in
-            guard let self else { return }
+            guard let self, !self.capture.isFollower else { return }
             self.selectedID = device.stableID
             self.attemptedDevice = nil
             self.devicesChanged(self.devices)
@@ -205,13 +208,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     }
 
     private func updatePicker() {
-        picker.update(devices: devices, selectedID: selectedID, activeID: latest?.device?.stableID,
-                      error: latest?.isError == true ? latest?.status : nil)
+        picker.update(devices: devices, selectedID: capture?.isFollower == true ? latest?.selectedDeviceID : selectedID, activeID: latest?.device?.stableID,
+                      error: latest?.isError == true ? latest?.status : nil,
+                      readOnly: capture?.isFollower == true)
     }
 
     private func updateElapsed() {
         guard let startedAt = latest?.snapshot.metadata.startedAt else { return }
-        let seconds = max(0, Int(Date().timeIntervalSince(startedAt)))
+        let end = latest?.snapshot.metadata.endedAt ?? Date()
+        let seconds = max(0, Int(end.timeIntervalSince(startedAt)))
         workspace.elapsedLabel.stringValue = String(format: "%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
     }
 
@@ -225,6 +230,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         let previousDevice = latest?.device
         let previousError = latest?.isError
         latest = update
+        if sessions.contains(where: { $0.metadata.id == update.snapshot.metadata.id }) {
+            sessions.removeAll { $0.metadata.id == update.snapshot.metadata.id }
+            rebuildSidebar()
+        }
         let connected = update.device != nil && !update.isError
         statusLabel.stringValue = connected ? "●  Interface connected" : (update.isError ? "●  Capture error" : "○  Waiting for interface")
         statusLabel.textColor = update.isError ? .systemRed : ConsoleTheme.secondary
@@ -233,6 +242,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         workspace.captureLabel.textColor = connected ? ConsoleTheme.green : ConsoleTheme.secondary
         workspace.recordingLabel.stringValue = connected ? "Raw recording active" : "Raw recording idle"
         workspace.recordingLabel.textColor = connected ? ConsoleTheme.green : ConsoleTheme.secondary
+        if capture?.isFollower == true {
+            workspace.recordingLabel.stringValue = update.ownerEnded ? "Capture ended" : "Following external capture"
+            workspace.recordingLabel.toolTip = "The process that started capture owns the interface. Closing this window will not stop it."
+        }
+        if update.ownerEnded {
+            statusLabel.stringValue = "○  Capture ended"
+            workspace.captureLabel.stringValue = "○  Stopped"
+        }
         workspace.savedLabel.stringValue = "\(formatBytes(update.snapshot.byteCount)) captured"
         workspace.deviceName.stringValue = update.device?.product ?? "Serial interface"
         workspace.deviceDetail.stringValue = connected ? "Connected · 115200 baud" : "Not connected · 115200 baud"
@@ -259,6 +276,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
 
     private func devicesChanged(_ connected: [SerialDevice]) {
         devices = connected
+        if capture.isFollower { updatePicker(); return }
         // A remembered board that is absent must never be replaced by a different board.
         if selectedID == nil, connected.count == 1 { selectedID = connected[0].stableID }
         if let chosen = connected.first(where: { $0.stableID == selectedID }) {
@@ -317,6 +335,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
             let unseen = bytes - min(bytes, log.snapshot?.byteCount ?? 0)
             positionLabel.stringValue = "Display paused · \(formatBytes(unseen)) captured since pause"
             jumpButton.title = "Jump to Latest"
+        } else if latest?.ownerEnded == true {
+            positionLabel.stringValue = "Capture ended · reopen Serialis to start a new capture"
+            jumpButton.isHidden = log.followsLatest
         } else if latest?.isError == true || disconnected {
             positionLabel.stringValue = latest?.isError == true ? (latest?.status ?? "Capture error") : "Interface disconnected · waiting to reconnect"
             jumpButton.isHidden = log.followsLatest
@@ -324,7 +345,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
             positionLabel.stringValue = "Reading earlier logs · capture continues"
             jumpButton.title = "Jump to Latest"
         }
-        workspace.messageVisible = !viewingHistory && (paused || !log.followsLatest || disconnected || latest?.isError == true)
+        workspace.messageVisible = !viewingHistory && (paused || !log.followsLatest || disconnected || latest?.isError == true || latest?.ownerEnded == true)
         pauseButton.isEnabled = !viewingHistory
     }
 
@@ -398,7 +419,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
             searchStatus.stringValue = "Opening session…"
             log.clear(message: "Opening saved session…")
             historyQueue.async { [weak self] in
-                let result = Result { try SessionReader.loadSnapshot(directory: snapshot.directory) }
+                let result = Result {
+                    if let active = try ActiveCaptureStore(rootDirectory: self?.root ?? snapshot.directory.deletingLastPathComponent()).active(),
+                       active.snapshot.metadata.id == snapshot.metadata.id { return active.snapshot }
+                    return try SessionReader.loadSnapshot(directory: snapshot.directory)
+                }
                 DispatchQueue.main.async {
                     guard let self, self.viewingHistory, self.sidebar.selectedRow == row else { return }
                     do {
